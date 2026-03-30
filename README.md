@@ -57,7 +57,7 @@ pip install ttkbootstrap
 | `fxc.exe` | DX11 HLSL compiler (SM 5.0) | [Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/) |
 | `dxc.exe` + `dxcompiler.dll` + `dxil.dll` | DX12 HLSL compiler (SM 6.x) | [Microsoft DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler) |
 | `cmd_Decompiler.exe` | DX11 shader decompiler | [HLSLDecompiler](https://github.com/bo3b/3Dmigoto) |
-| `decomp.exe` | DX12 shader decompiler | [dxbc_reader](https://github.com/etnlGD/dxbc_reader) |
+| `decomp.exe` | DX12 shader decompiler | [RenoDX](https://github.com/clshortfuse/renodx) |
 | `dxil-spirv.exe` | DXIL → SPIR-V converter | [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv) |
 | `spirv-cross.exe` | SPIR-V → HLSL converter | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) |
 
@@ -173,7 +173,7 @@ show_welcome_banner = true
 - DX12 compiler: [Microsoft DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler) (MIT License)
 - SPIR-V tools: [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv) (LGPL), [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) (Apache 2.0)
 - DX11 decompiler: [3Dmigoto/HLSLDecompiler](https://github.com/bo3b/3Dmigoto)
-- DX12 decompiler: [dxbc_reader](https://github.com/etnlGD/dxbc_reader)
+- DX12 decompiler: [RenoDX](https://github.com/clshortfuse/renodx)
 
 ## License
 
