@@ -1,0 +1,1891 @@
+import os
+import re
+import subprocess
+import tkinter as tk
+import shutil
+import threading
+import queue
+import time
+import traceback
+import sys
+
+# --- MODULES IMPORT ---
+try:
+    import ttkbootstrap as ttk
+    from ttkbootstrap.constants import *
+    MODERN_UI = True
+except ImportError:
+    import tkinter as tk
+    import tkinter.ttk as ttk
+    from tkinter import TOP, BOTTOM, LEFT, RIGHT, BOTH, X, Y, END, VERTICAL, HORIZONTAL
+    MODERN_UI = False
+    print("WARNING: ttkbootstrap not found. Using standard tkinter.")
+
+# Fix for capitalization in ttkbootstrap
+if not hasattr(ttk, 'PanedWindow') and hasattr(ttk, 'Panedwindow'):
+    ttk.PanedWindow = ttk.Panedwindow
+
+# Import local modules with error handling
+try:
+    import fxc_parser
+    from config import ConfigManager
+    from manual import ManualWindow
+    from defines import DefineManagerWindow
+    from tooltips import hint
+    from tkinter import filedialog, messagebox
+    from awclib.parser import parse_awc_file
+    from awclib.awc_writer import AWCRebuilder
+    from awclib.models import AWCFile, Shader
+    from awclib.decompiler import decompile_shader
+except ImportError as e:
+    print(f"Critical Import Error: {e}")
+    print("Ensure fxc_parser.py, config.py, manual.py, defines.py, tooltips.py and awclib folder are in the same folder.")
+
+# --- ASM WINDOW CLASS ---
+class AsmWindow(ttk.Toplevel):
+    def __init__(self, parent, filename, content):
+        super().__init__(parent)
+        self.title(f"ASM: {filename}")
+        self.geometry("900x700")
+        
+        
+        container = ttk.Frame(self)
+        container.pack(fill=BOTH, expand=True, padx=5, pady=(5, 0))
+        
+        self.text_area = tk.Text(container, font=("Consolas", 10), bg="#002b36", fg="#839496", insertbackground="white", bd=0)
+        self.text_area.pack(side=LEFT, fill=BOTH, expand=True)
+        
+        sb = ttk.Scrollbar(container, orient=VERTICAL, command=self.text_area.yview)
+        sb.pack(side=RIGHT, fill=Y)
+        self.text_area.config(yscrollcommand=sb.set)
+        
+        self.text_area.insert(END, content)
+        self.text_area.config(state=tk.DISABLED)
+
+        
+        btn_frame = ttk.Frame(self, padding=10)
+        btn_frame.pack(side=BOTTOM, fill=X)
+        
+        ttk.Button(btn_frame, text="Close", command=self.destroy, bootstyle="secondary").pack(side=RIGHT, padx=5)
+        ttk.Button(btn_frame, text="📋 Copy All", command=self.copy_all, bootstyle="success").pack(side=RIGHT, padx=5)
+
+    def copy_all(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.text_area.get("1.0", END))
+        self.update()  
+
+# --- MAIN APP ---
+class ShaderManagerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("GTA V Shader Manager v0.0.2")
+        
+        self.cfg_mgr = ConfigManager()
+        self.config = self.cfg_mgr.load()
+        
+        w, h = self.config["Window"]["width"], self.config["Window"]["height"]
+        self.root.geometry(f"{w}x{h}")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # UI Styling
+        if MODERN_UI:
+            style = ttk.Style()
+            style.configure("Treeview", font=("Segoe UI", 10), rowheight=30)
+            style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+            style.configure("TButton", font=("Segoe UI", 10))
+            style.configure("Sidebar.TButton", font=("Segoe UI", 12), anchor="w", padding=15, background="#002b36", foreground="#839496", borderwidth=0)
+            style.map("Sidebar.TButton", background=[('active', '#073642'), ('selected', '#2aa198')], foreground=[('active', 'white'), ('selected', 'white')])
+
+        # --- PATH SETUP ---
+        if getattr(sys, 'frozen', False):
+            self.base_dir = os.path.dirname(sys.executable)
+        else:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        self.dirs = {
+            "source": os.path.join(self.base_dir, "source"),
+            "compiled": os.path.join(self.base_dir, "compiled"),
+            "decompiled": os.path.join(self.base_dir, "decompiled"),
+            "fxc": os.path.join(self.base_dir, "fxc_files"),
+            "awc": os.path.join(self.base_dir, "awc_files"),
+            "compilers": os.path.join(self.base_dir, "dxcompilers")
+        }
+        self.tools = {
+            "fxc": os.path.join(self.base_dir, self.config["Paths"]["fxc_path"]),
+            "decompiler": os.path.join(self.base_dir, self.config["Paths"]["decompiler_path"]),
+            "dxc": os.path.join(self.base_dir, self.config["Paths"]["dx12_compiler_path"]),
+            "dxil_spirv": os.path.join(self.base_dir, self.config["Paths"]["dxil_spirv_path"]),
+            "spirv_cross": os.path.join(self.base_dir, self.config["Paths"]["spirv_cross_path"]),
+            "decomp_fallback": os.path.join(self.base_dir, self.config["Paths"]["decomp_fallback_path"])
+        }
+        self.hash_txt = os.path.join(self.base_dir, "hash.txt")
+
+        # State
+        self.source_mode_var = tk.StringVar(value=self.config["Window"]["mode"])
+        self.watcher_var = tk.BooleanVar(value=False)
+        self.search_var = tk.StringVar()
+        self.search_var.trace("w", self._filter_source)
+        self.hash_map = {}
+        self.msg_queue = queue.Queue()
+        self.is_processing = False
+        self.watcher_running = False
+        self.current_page = None
+        self.pages = {}
+        self.show_welcome = self.config["Window"].get("show_welcome_banner", "true").lower() == "true"
+
+        self.dx_version = tk.StringVar(value="dx11")  # Default to DX11
+        self.decomp_method_var = tk.StringVar(value="spirv")  # Default to SPIR-V pipeline
+
+        self._setup_fs()
+        self._load_hashes()
+        self._build_layout()
+        
+        self.root.after(200, self._process_queue)
+        
+        # Ensure UI state matches default values (handle hiding method selector for DX11)
+        self._on_dx_change()
+
+    def _setup_fs(self):
+        # Create base directories
+        for d in self.dirs.values(): os.makedirs(d, exist_ok=True)
+        
+        # Create DX11/DX12 subdirectories for relevant folders
+        for key in ["source", "compiled", "decompiled"]:
+            base = self.dirs[key]
+            os.makedirs(os.path.join(base, "dx11"), exist_ok=True)
+            os.makedirs(os.path.join(base, "dx12"), exist_ok=True)
+
+    def on_close(self):
+        self.watcher_running = False
+        self.config["Window"]["width"] = str(self.root.winfo_width())
+        self.config["Window"]["height"] = str(self.root.winfo_height())
+        self.config["Window"]["mode"] = self.source_mode_var.get()
+        self.cfg_mgr.save()
+        self.root.destroy()
+
+    def _get_current_dir(self, key):
+        """Returns path with dx11/dx12 subfolder for source/compiled/decompiled"""
+        if key in ["source", "compiled", "decompiled"]:
+            version = self.dx_version.get()
+            return os.path.join(self.dirs[key], version)
+        return self.dirs[key]
+
+    # --- HELPER: SCROLLABLE TREE ---
+    def _create_scrolled_tree(self, parent, **kwargs):
+        """Creates a Treeview with automatic vertical and horizontal scrollbars."""
+        container = ttk.Frame(parent)
+        
+        # Scrollbars
+        vsb = ttk.Scrollbar(container, orient=VERTICAL, bootstyle="secondary-round")
+        hsb = ttk.Scrollbar(container, orient=HORIZONTAL, bootstyle="secondary-round")
+        
+        # Tree
+        tree = ttk.Treeview(container, yscrollcommand=vsb.set, xscrollcommand=hsb.set, **kwargs)
+        vsb.config(command=tree.yview)
+        hsb.config(command=tree.xview)
+        
+        # Grid Layout
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+        
+        return container, tree
+
+    # --- UI BUILDING ---
+    def _build_layout(self):
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill=BOTH, expand=True)
+
+        # Sidebar
+        sidebar = ttk.Frame(main_container, bootstyle="dark", width=250)
+        sidebar.pack(side=LEFT, fill=Y)
+        
+        lbl_brand = ttk.Label(sidebar, text="GTA V\nSHADER MANAGER", font=("Segoe UI", 18, "bold"), bootstyle="inverse-dark", justify="center")
+        lbl_brand.pack(pady=(25, 5), padx=20)
+        lbl_version = ttk.Label(sidebar, text="v0.0.2", font=("Segoe UI", 9), bootstyle="inverse-dark", justify="center")
+        lbl_version.pack(pady=(0, 30), padx=20)
+
+        self.btn_dev = ttk.Button(sidebar, text="🔧  Compile & Decompile", style="Sidebar.TButton", command=lambda: self._show_page("dev"))
+        self.btn_dev.pack(fill=X, pady=2)
+        hint(self.btn_dev, "Compile HLSL source to .cso binaries,\nor decompile .cso back to HLSL.")
+        
+        self.btn_fxc = ttk.Button(sidebar, text="📦  FXC Archives", style="Sidebar.TButton", command=lambda: self._show_page("fxc"))
+        self.btn_fxc.pack(fill=X, pady=2)
+        hint(self.btn_fxc, "Unpack and repack DX11 .fxc shader archives\nused by the game engine.")
+        
+        self.btn_awc = ttk.Button(sidebar, text="📦  AWC Archives", style="Sidebar.TButton", command=lambda: self._show_page("awc"))
+        hint(self.btn_awc, "Browse and modify DX12 .awc shader libraries.\nImport/export individual shader binaries.")
+        # Do not pack awc button initially; handled by _on_dx_change
+        
+        ttk.Frame(sidebar, height=2, bootstyle="secondary").pack(fill=X, pady=20, padx=20) 
+
+        self.btn_help = ttk.Button(sidebar, text="📖  Help & Docs", style="Sidebar.TButton", command=lambda: ManualWindow(self.root))
+        self.btn_help.pack(fill=X, pady=2)
+        hint(self.btn_help, "Open the documentation window with\nstep-by-step guides and troubleshooting.")
+
+        # Content Area
+        content_area = ttk.Frame(main_container)
+        content_area.pack(side=LEFT, fill=BOTH, expand=True)
+
+        # Top Bar
+        self.top_bar = ttk.Frame(content_area, padding=15, bootstyle="bg")
+        self.top_bar.pack(fill=X)
+        self.lbl_title = ttk.Label(self.top_bar, text="Dashboard", font=("Segoe UI", 18))
+        self.lbl_title.pack(side=LEFT)
+        self.status_badge = ttk.Label(self.top_bar, text="Ready", bootstyle="success-inverse", padding=(10, 5))
+        self.status_badge.pack(side=RIGHT)
+
+        # Pages
+        self.page_container = ttk.Frame(content_area)
+        self.page_container.pack(fill=BOTH, expand=True, padx=20, pady=(0, 20))
+
+        # Log & Progress
+        term_frame = ttk.Labelframe(content_area, text=" Log Output ", padding=0, bootstyle="secondary")
+        term_frame.pack(fill=X, padx=20, pady=(0, 20), ipady=5)
+        
+        self.log_widget = tk.Text(term_frame, height=6, state=tk.DISABLED, bg="#002b36", fg="#2aa198", font=("Consolas", 10), bd=0)
+        self.log_widget.pack(side=LEFT, fill=BOTH, expand=True, padx=5, pady=5)
+        scr = ttk.Scrollbar(term_frame, command=self.log_widget.yview); scr.pack(side=RIGHT, fill=Y)
+        self.log_widget.config(yscrollcommand=scr.set)
+        
+        self.progress = ttk.Progressbar(content_area, mode='determinate', bootstyle="info-striped")
+        self.progress.pack(fill=X, side=BOTTOM)
+
+        self._init_dev_page()
+        self._init_fxc_page()
+        self._init_awc_page()
+        self._show_page("dev")
+
+    def _show_page(self, page_name):
+        for page in self.pages.values(): page.pack_forget()
+        self.btn_dev.configure(bootstyle="dark")
+        self.btn_fxc.configure(bootstyle="dark")
+        if hasattr(self, 'btn_awc'):
+            self.btn_awc.configure(bootstyle="dark")
+
+        if page_name in self.pages:
+            self.pages[page_name].pack(fill=BOTH, expand=True)
+            self.current_page = page_name
+        
+        if page_name == "dev":
+            self.lbl_title.config(text="Compile & Decompile Shaders")
+            self.btn_dev.configure(bootstyle="primary") 
+        elif page_name == "fxc":
+            self.lbl_title.config(text="FXC Archives")
+            self.btn_fxc.configure(bootstyle="primary")
+        elif page_name == "awc":
+            self.lbl_title.config(text="AWC Archives")
+            if hasattr(self, 'btn_awc'):
+                self.btn_awc.configure(bootstyle="primary")
+
+    def _init_dev_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["dev"] = page
+        
+        # --- Welcome Banner (dismissible) ---
+        if self.show_welcome:
+            self.welcome_frame = ttk.Frame(page, padding=10, bootstyle="info")
+            self.welcome_frame.pack(fill=X, pady=(0, 10))
+            
+            ttk.Label(self.welcome_frame, text="📌  Getting Started", font=("Segoe UI", 10, "bold"), bootstyle="inverse-info").pack(side=LEFT, padx=(0, 10))
+            ttk.Label(self.welcome_frame, text="👋 New here? To mod a GTA V shader, you first need to unpack the game's shader archive. For GTA 5 Legacy (DX11) use 'FXC Archives', for GTA 5 Enhanced (DX12) use 'AWC Archives' — then decompile it to get editable code, make your changes, compile, and repack. Click 'Help & Docs' on the left for a full step-by-step guide.", wraplength=900, bootstyle="inverse-info").pack(side=LEFT, fill=X, expand=True)
+            
+            def dismiss_banner():
+                self.welcome_frame.pack_forget()
+                self.show_welcome = False
+                self.config["Window"]["show_welcome_banner"] = "false"
+            
+            ttk.Button(self.welcome_frame, text="✕ Dismiss", command=dismiss_banner, bootstyle="outline-light").pack(side=RIGHT, padx=(10, 0))
+        
+        # --- Toolbar ---
+        toolbar = ttk.Frame(page, padding=(0, 0, 0, 10))
+        toolbar.pack(fill=X)
+
+        # DirectX Version section
+        ttk.Label(toolbar, text="DirectX Version:", font=("Segoe UI", 9, "bold"), foreground="#d33682").pack(side=LEFT, padx=(0, 5))
+        rb_dx11 = ttk.Radiobutton(toolbar, text="DX11 — Legacy", variable=self.dx_version, value="dx11", command=self._on_dx_change, bootstyle="toolbutton-primary")
+        rb_dx11.pack(side=LEFT, padx=2)
+        hint(rb_dx11, "GTA 5 Legacy (older version).\nDirectX 11, Shader Model 5.0, fxc.exe compiler.\nUses .fxc shader archives.")
+        rb_dx12 = ttk.Radiobutton(toolbar, text="DX12 — Enhanced", variable=self.dx_version, value="dx12", command=self._on_dx_change, bootstyle="toolbutton-danger")
+        rb_dx12.pack(side=LEFT, padx=2)
+        hint(rb_dx12, "GTA 5 Enhanced (new version).\nDirectX 12, Shader Model 6.0+, dxc.exe compiler.\nUses .awc shader archives.")
+        
+        ttk.Separator(toolbar, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=10)
+
+        # Decompilation Method (DX12 only - shown/hidden by _on_dx_change)
+        self.fr_decomp_method = ttk.Frame(toolbar)
+        ttk.Label(self.fr_decomp_method, text="Decompile Method:", font=("Segoe UI", 9, "bold"), foreground="#cb4b16").pack(side=LEFT, padx=(0, 5))
+        rb_spirv = ttk.Radiobutton(self.fr_decomp_method, text="SPIR-V", variable=self.decomp_method_var, value="spirv", bootstyle="toolbutton-warning")
+        rb_spirv.pack(side=LEFT, padx=2)
+        hint(rb_spirv, "Two-step pipeline: dxil-spirv → spirv-cross.\nProduces cleaner HLSL but may miss some features.")
+        rb_decomp = ttk.Radiobutton(self.fr_decomp_method, text="Decomp.exe", variable=self.decomp_method_var, value="decomp", bootstyle="toolbutton-secondary")
+        rb_decomp.pack(side=LEFT, padx=2)
+        hint(rb_decomp, "Direct decompilation using decomp.exe.\nFallback method for shaders that fail SPIR-V pipeline.")
+        
+        self.sep_view_mode = ttk.Separator(toolbar, orient=VERTICAL)
+        self.sep_view_mode.pack(side=LEFT, fill=Y, padx=10)
+
+        # View Mode section
+        ttk.Label(toolbar, text="File View:", font=("Segoe UI", 9, "bold"), foreground="#93a1a1").pack(side=LEFT, padx=(0, 5))
+        rb_workspace = ttk.Radiobutton(toolbar, text="📂 Workspace", variable=self.source_mode_var, value="source", command=self.refresh_source, bootstyle="toolbutton-info")
+        rb_workspace.pack(side=LEFT, padx=2)
+        hint(rb_workspace, "Show files from the /source/ folder.\nThis is your main editing workspace.")
+        rb_decompiled = ttk.Radiobutton(toolbar, text="🔓 Decompiled", variable=self.source_mode_var, value="decompiled", command=self.refresh_source, bootstyle="toolbutton-secondary")
+        rb_decompiled.pack(side=LEFT, padx=2)
+        hint(rb_decompiled, "Show files from the /decompiled/ folder.\nRead-only reference of decompiled shaders.")
+
+        btn_refresh = ttk.Button(toolbar, text="⟳ Refresh All", command=self.refresh_all, bootstyle="light-outline")
+        btn_refresh.pack(side=LEFT, padx=15)
+        hint(btn_refresh, "Reload all file lists across every tab.")
+
+        chk_watch = ttk.Checkbutton(toolbar, text="Auto-Compile (Watch)", variable=self.watcher_var, command=self._toggle_watcher, bootstyle="round-toggle-success")
+        chk_watch.pack(side=RIGHT)
+        hint(chk_watch, "When enabled, saving a .hlsl file in your\nexternal editor triggers an instant recompile.")
+
+        # --- Paned panels ---
+        panes = ttk.PanedWindow(page, orient=HORIZONTAL)
+        panes.pack(fill=BOTH, expand=True)
+
+        # LEFT PANEL - Source Files
+        p1 = ttk.Frame(panes)
+        panes.add(p1, weight=1)
+        
+        ttk.Label(p1, text="📂  Source Files (.hlsl)", font=("Segoe UI", 10, "bold"), foreground="#268bd2").pack(fill=X, pady=(0, 5))
+        
+        search_fr = ttk.Frame(p1, padding=(0, 0, 0, 0))
+        search_fr.pack(fill=X)
+        search_entry = ttk.Entry(search_fr, textvariable=self.search_var, bootstyle="primary", width=30)
+        search_entry.pack(side=LEFT, fill=X, expand=True)
+        hint(search_entry, "Type to filter shaders by filename.")
+        ttk.Label(search_fr, text="🔍", font=("Segoe UI", 12)).pack(side=RIGHT, padx=5)
+
+        src_container, self.src_tree = self._create_scrolled_tree(p1, show="tree", bootstyle="info")
+        src_container.pack(fill=BOTH, expand=True, pady=5)
+        
+        self.src_tree.bind("<Double-1>", self._open_src_file)
+        self.src_tree.bind("<Button-3>", lambda e: self._ctx_menu(e, self.src_tree, "src"))
+
+        act_fr = ttk.Frame(p1, padding=(0, 5, 0, 0))
+        act_fr.pack(fill=X)
+        
+        btn_row = ttk.Frame(act_fr)
+        btn_row.pack(fill=X, pady=2)
+        btn_sel_src = ttk.Button(btn_row, text="Select All", command=lambda: self._select_all(self.src_tree), bootstyle="secondary-outline")
+        btn_sel_src.pack(side=LEFT, fill=X, expand=True, padx=(0, 2))
+        hint(btn_sel_src, "Select every source file in the list.")
+        btn_compile = ttk.Button(btn_row, text="▶ Compile Selected", command=self.compile_async, bootstyle="success")
+        btn_compile.pack(side=LEFT, fill=X, expand=True, padx=(2, 0))
+        hint(btn_compile, "Compile the selected .hlsl file(s) to .cso binaries.\nOutput goes to the /compiled/ folder.")
+        
+        sub_act = ttk.Frame(act_fr); sub_act.pack(fill=X)
+        btn_defines = ttk.Button(sub_act, text="⚙ Global Defines", command=self.open_defines, bootstyle="secondary")
+        btn_defines.pack(side=LEFT, fill=X, expand=True, padx=(0, 2))
+        hint(btn_defines, "Open the Global Defines manager.\nBulk-edit #define values across multiple shader files.")
+        btn_organize = ttk.Button(sub_act, text="📂 Organize Files", command=self.organize_source_files, bootstyle="info")
+        btn_organize.pack(side=LEFT, fill=X, expand=True, padx=2)
+        hint(btn_organize, "Auto-sort source files into subfolders\nbased on shader type (VS, PS, CS, etc.).")
+        btn_edit = ttk.Button(sub_act, text="📝 Open in Editor", command=self._open_editor, bootstyle="secondary")
+        btn_edit.pack(side=LEFT, fill=X, expand=True, padx=(2, 0))
+        hint(btn_edit, "Open the selected file in your configured\ntext editor (or system default).")
+
+        # RIGHT PANEL - Compiled Output
+        p2 = ttk.Frame(panes)
+        panes.add(p2, weight=1)
+        
+        ttk.Label(p2, text="⚙  Compiled Output (.cso)", font=("Segoe UI", 10, "bold"), foreground="#b58900").pack(fill=X, pady=(0, 5))
+        
+        cmp_container, self.cmp_tree = self._create_scrolled_tree(p2, show="tree", bootstyle="warning")
+        cmp_container.pack(fill=BOTH, expand=True)
+        
+        self.cmp_tree.bind("<Button-3>", lambda e: self._ctx_menu(e, self.cmp_tree, "cmp"))
+        
+        # Right panel buttons
+        r_btns = ttk.Frame(p2)
+        r_btns.pack(fill=X, pady=(10, 0))
+        
+        btn_sel_cmp = ttk.Button(r_btns, text="Select All", command=lambda: self._select_all(self.cmp_tree), bootstyle="secondary-outline")
+        btn_sel_cmp.pack(side=LEFT, fill=X, expand=True, padx=(0, 2))
+        hint(btn_sel_cmp, "Select every compiled binary in the list.")
+        btn_asm = ttk.Button(r_btns, text="📜 View ASM", command=self.view_asm_selected, bootstyle="info-outline")
+        btn_asm.pack(side=LEFT, fill=X, expand=True, padx=2)
+        hint(btn_asm, "Disassemble the selected .cso and view\nthe raw assembly instructions.")
+        btn_decompile = ttk.Button(r_btns, text="▼ Decompile to HLSL", command=self.decompile_async, bootstyle="warning")
+        btn_decompile.pack(side=LEFT, fill=X, expand=True, padx=(2, 0))
+        hint(btn_decompile, "Decompile selected .cso file(s) back to\n.hlsl source code in the /decompiled/ folder.")
+
+        # Context Menus
+        self.ctx_src = tk.Menu(self.root, tearoff=0, bg="#073642", fg="#93a1a1", activebackground="#2aa198", activeforeground="white")
+        self.ctx_src.add_command(label="Open File Location", command=self._ctx_open_folder)
+        self.ctx_src.add_command(label="Open in Editor", command=self._open_editor)
+
+        self.ctx_cmp = tk.Menu(self.root, tearoff=0, bg="#073642", fg="#93a1a1", activebackground="#2aa198", activeforeground="white")
+        self.ctx_cmp.add_command(label="View ASM Code", command=self.view_asm_selected)
+        self.ctx_cmp.add_command(label="Open File Location", command=self._ctx_open_folder)
+
+    def _init_fxc_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["fxc"] = page
+        
+        # --- Info Banner ---
+        banner = ttk.Frame(page, padding=10, bootstyle="warning")
+        banner.pack(fill=X, pady=(0, 10))
+        ttk.Label(banner, text="📦  GTA 5 Legacy — DX11 Archives", font=("Segoe UI", 10, "bold"), bootstyle="inverse-warning").pack(side=LEFT, padx=(0, 10))
+        ttk.Label(banner, text="This tab is for GTA 5 Legacy (older version). Select a .fxc archive file on the left, then: 1) Unpack it to extract shaders,  2) Go to 'Compile & Decompile' to edit and recompile,  3) Come back here and Repack to inject your changes back into the archive.", wraplength=900, bootstyle="inverse-warning").pack(side=LEFT, fill=X, expand=True)
+        
+
+        tools = ttk.Frame(page)
+        tools.pack(fill=X, pady=(0, 10))
+        
+        btn_fxc_sel = ttk.Button(tools, text="Select All", command=lambda: self._select_all(self.fxc_tree), bootstyle="secondary-outline")
+        btn_fxc_sel.pack(side=LEFT, padx=(0, 5))
+        hint(btn_fxc_sel, "Select all FXC archives in the workspace list.")
+        btn_unpack = ttk.Button(tools, text="📦 Unpack", command=self.unpack_fxc, bootstyle="info")
+        btn_unpack.pack(side=LEFT, padx=(0, 5))
+        hint(btn_unpack, "Extract all shaders from the selected .fxc\narchive(s) into /compiled/dx11/ as .cso files.")
+        btn_repack = ttk.Button(tools, text="📤 Repack", command=self.repack_fxc, bootstyle="warning")
+        btn_repack.pack(side=LEFT, padx=(0, 15))
+        hint(btn_repack, "Inject modified .cso files back into the\nselected .fxc archive. Only changed shaders\nare updated. A backup is created automatically.")
+
+        btn_fxc_save = ttk.Button(tools, text="💾 Save FXC", command=self._fxc_save, bootstyle="success")
+        btn_fxc_save.pack(side=LEFT, padx=(0, 15))
+        hint(btn_fxc_save, "Save the currently loaded FXC to a file.\nUse after importing CSO data into shaders.")
+        
+        btn_fxc_imp = ttk.Button(tools, text="📥 Import CSO", command=self._fxc_import, bootstyle="warning")
+        btn_fxc_imp.pack(side=LEFT, padx=(0, 5))
+        hint(btn_fxc_imp, "Replace the selected shader's bytecode with\na .cso file from disk. Remember to Save FXC after.")
+        btn_fxc_exp = ttk.Button(tools, text="📤 Export CSO", command=self._fxc_export, bootstyle="secondary")
+        btn_fxc_exp.pack(side=LEFT)
+        hint(btn_fxc_exp, "Export the selected shader(s) as .cso files\nto /compiled/dx11/<archive_name>/<type>/.")
+        
+        btn_fxc_ref = ttk.Button(tools, text="⟳ Refresh", command=self.refresh_all, bootstyle="link")
+        btn_fxc_ref.pack(side=RIGHT)
+        hint(btn_fxc_ref, "Reload all file lists.")
+
+        self.fxc_status_var = tk.StringVar(value="Ready — No FXC selected")
+        ttk.Label(tools, textvariable=self.fxc_status_var, bootstyle="secondary-inverse", padding=(5, 2)).pack(side=RIGHT, padx=10)
+
+        panes = ttk.PanedWindow(page, orient=HORIZONTAL)
+        panes.pack(fill=BOTH, expand=True)
+
+        # LEFT: Workspace FXC Archives
+        files_fr = ttk.Labelframe(panes, text=" FXC Archives in /fxc_files/ ", padding=5)
+        panes.add(files_fr, weight=1)
+
+        search_fr = ttk.Frame(files_fr)
+        search_fr.pack(fill=X, pady=(0, 5))
+        ttk.Label(search_fr, text="🔍 Filter:", font=("Segoe UI", 9)).pack(side=LEFT, padx=(0, 5))
+        self.fxc_search_var = tk.StringVar()
+        self.fxc_search_var.trace_add("write", lambda *args: self.refresh_fxc_list())
+        ttk.Entry(search_fr, textvariable=self.fxc_search_var).pack(side=LEFT, fill=X, expand=True)
+
+        cols = ("size", "count", "path")
+        fxc_container, self.fxc_tree = self._create_scrolled_tree(files_fr, columns=cols, show="headings", bootstyle="primary")
+        fxc_container.pack(fill=BOTH, expand=True)
+
+        self.fxc_tree.heading("size", text="Size"); self.fxc_tree.column("size", width=80, anchor="e")
+        self.fxc_tree.heading("count", text="Shaders"); self.fxc_tree.column("count", width=80, anchor="e")
+        self.fxc_tree.heading("path", text="Filename"); self.fxc_tree.column("path", width=200)
+        self.fxc_tree.bind("<<TreeviewSelect>>", self._on_fxc_file_select)
+        self.fxc_tree.bind("<Double-1>", self._on_fxc_double_click)
+
+        # MIDDLE: Shaders inside FXC
+        middle_fr = ttk.Frame(panes)
+        panes.add(middle_fr, weight=2)
+        
+        sh_search_fr = ttk.Frame(middle_fr)
+        sh_search_fr.pack(fill=X, pady=(0, 5))
+        ttk.Label(sh_search_fr, text="🔍 Filter shaders:", font=("Segoe UI", 9)).pack(side=LEFT, padx=(0, 5))
+        self.fxc_shader_search_var = tk.StringVar()
+        self.fxc_shader_search_var.trace_add("write", lambda *args: self._fxc_populate_tree())
+        ttk.Entry(sh_search_fr, textvariable=self.fxc_shader_search_var).pack(side=LEFT, fill=X, expand=True)
+
+        cols_s = ("type", "size")
+        tree_container, self.fxc_shader_tree = self._create_scrolled_tree(middle_fr, columns=cols_s, show="tree headings", bootstyle="info")
+        tree_container.pack(fill=BOTH, expand=True)
+        
+        self.fxc_shader_tree.heading("#0", text="Shader Name", anchor="w")
+        self.fxc_shader_tree.heading("type", text="Type", anchor="w")
+        self.fxc_shader_tree.heading("size", text="Size (Bytes)", anchor="e")
+        self.fxc_shader_tree.column("#0", width=250)
+        self.fxc_shader_tree.column("type", width=80)
+        self.fxc_shader_tree.column("size", width=100, anchor="e")
+        self.fxc_shader_tree.bind("<<TreeviewSelect>>", self._on_fxc_shader_select)
+        
+        # RIGHT: Details
+        details_fr = ttk.Labelframe(panes, text=" Shader Details ", padding=10)
+        panes.add(details_fr, weight=1)
+        
+        self.fxc_details = tk.Text(details_fr, font=("Consolas", 10), bg="#002b36", fg="#93a1a1", bd=0, wrap="word")
+        self.fxc_details.pack(fill=BOTH, expand=True)
+        self.fxc_details.config(state=tk.NORMAL)
+        self.fxc_details.insert(tk.END, "Select a shader from the list\nto view its details here.")
+        self.fxc_details.config(state=tk.DISABLED)
+        
+        # State variables
+        self.fxc_current_file = None
+        self.fxc_current_shader = None
+
+    def _on_fxc_double_click(self, event):
+        item = self.fxc_tree.identify_row(event.y)
+        if item:
+            self.fxc_tree.selection_set(item)
+            self.unpack_fxc()
+
+    def _on_fxc_file_select(self, event):
+        sel = self.fxc_tree.selection()
+        if not sel: return
+        tags = self.fxc_tree.item(sel[0], "tags")
+        if tags and len(tags) > 0:
+            filepath = tags[0]
+            if os.path.exists(filepath):
+                self._load_fxc_file(filepath)
+
+    def _load_fxc_file(self, filepath):
+        try:
+            self._log(f"Parsing FXC: {os.path.basename(filepath)}...")
+            with open(filepath, 'rb') as f: data = f.read()
+            self.fxc_current_file = fxc_parser.FxcFile()
+            self.fxc_current_file.load(data)
+            
+            self.fxc_current_filepath = filepath
+            
+            self.fxc_status_var.set(f"Loaded: {os.path.basename(filepath)}")
+            self._fxc_populate_tree()
+            self._log(f"Successfully loaded FXC headers.")
+        except Exception as e:
+            self.fxc_status_var.set(f"Error parsing FXC")
+            self._log(f"FXC Parse Error: {e}")
+
+    def _fxc_populate_tree(self):
+        self.fxc_shader_tree.delete(*self.fxc_shader_tree.get_children())
+        if not self.fxc_current_file: return
+        
+        search_term = ""
+        if hasattr(self, 'fxc_shader_search_var'):
+            search_term = self.fxc_shader_search_var.get().lower()
+            
+        categories = [
+            ("Vertex Shaders", self.fxc_current_file.ShaderGroups[0].Shaders, "VS"),
+            ("Pixel Shaders", self.fxc_current_file.ShaderGroups[1].Shaders, "PS"),
+            ("Compute Shaders", self.fxc_current_file.ShaderGroups[2].Shaders, "CS"),
+            ("Domain Shaders", self.fxc_current_file.ShaderGroups[3].Shaders, "DS"),
+            ("Geometry Shaders", self.fxc_current_file.ShaderGroups[4].Shaders, "GS"),
+            ("Hull Shaders", self.fxc_current_file.ShaderGroups[5].Shaders, "HS")
+        ]
+        
+        self.fxc_shader_map = {}
+        for cat_name, shaders, sh_type in categories:
+            if not shaders: continue
+            
+            filtered = []
+            for s in shaders:
+                if search_term in s.Name.lower():
+                    filtered.append(s)
+                    
+            if not filtered: continue
+            
+            cat_id = self.fxc_shader_tree.insert("", "end", text=f"{cat_name} ({len(filtered)})", values=("", ""), open=True)
+            for s in filtered:
+                item_id = self.fxc_shader_tree.insert(cat_id, "end", text=s.Name, values=(sh_type, f"{len(s.ByteCode):,}"))
+                self.fxc_shader_map[item_id] = s
+
+    def _on_fxc_shader_select(self, event):
+        sel = self.fxc_shader_tree.selection()
+        if sel and hasattr(self, 'fxc_shader_map') and sel[0] in self.fxc_shader_map:
+            shader = self.fxc_shader_map[sel[0]]
+            self.fxc_current_shader = shader
+            
+            details = f"Name: {shader.Name}\n"
+            details += f"Binary Size: {len(shader.ByteCode):,} bytes\n"
+            version_str = f"{shader.VersionMajor}.{shader.VersionMinor}"
+            details += f"DXBC Version: {version_str}\n\n"
+            
+            if shader.Variables:
+                details += f"Variables ({len(shader.Variables)}):\n"
+                for v in shader.Variables:
+                    details += f"  - {v}\n"
+                details += "\n"
+                
+            if shader.Buffers:
+                details += f"Buffers ({len(shader.Buffers)}):\n"
+                for b in shader.Buffers:
+                    details += f"  - [{b.Slot}] {b.Name}\n"
+            
+            self.fxc_details.config(state=tk.NORMAL)
+            self.fxc_details.delete("1.0", tk.END)
+            self.fxc_details.insert(tk.END, details)
+            self.fxc_details.config(state=tk.DISABLED)
+        else:
+            self.fxc_current_shader = None
+            self.fxc_details.config(state=tk.NORMAL)
+            self.fxc_details.delete("1.0", tk.END)
+            self.fxc_details.config(state=tk.DISABLED)
+
+    def _fxc_import(self):
+        if not hasattr(self, 'fxc_current_file') or not self.fxc_current_file: return messagebox.showwarning("Warning", "Open an FXC file first.")
+        if not hasattr(self, 'fxc_current_shader') or not self.fxc_current_shader: return messagebox.showwarning("Warning", "Select a shader from the list first.")
+        
+        shader = self.fxc_current_shader
+        
+        # Determine the group folder ("VS", "PS", etc.)
+        g_names = ["VS", "PS", "CS", "DS", "GS", "HS"]
+        group_name = "VS"
+        for i, grp in enumerate(self.fxc_current_file.ShaderGroups):
+            if shader in grp.Shaders:
+                group_name = g_names[i]
+                break
+                
+        fxc_name = os.path.splitext(os.path.basename(self.fxc_current_filepath))[0]
+        initial_dir = os.path.join(self.dirs["compiled"], "dx11", fxc_name, group_name)
+        if not os.path.exists(initial_dir):
+            initial_dir = os.path.join(self.dirs["compiled"], "dx11")
+            
+        filepath = filedialog.askopenfilename(title=f"Import CSO for {shader.Name}", initialdir=initial_dir, filetypes=[("Compiled Shaders", "*.cso"), ("All Files", "*.*")])
+        if not filepath: return
+        
+        try:
+            with open(filepath, "rb") as f:
+                new_bytecode = f.read()
+                
+            if len(new_bytecode) == 0:
+                messagebox.showerror("Error", "Selected file is empty.")
+                return
+                
+            shader.ByteCode = new_bytecode
+            self._log(f"FXC: Imported new bytecode for {shader.Name} ({len(new_bytecode)} bytes)")
+            
+            # Refresh the tree item size
+            sel = self.fxc_shader_tree.selection()
+            if sel:
+                vals = self.fxc_shader_tree.item(sel[0], "values")
+                if vals:
+                    self.fxc_shader_tree.item(sel[0], values=(vals[0], f"{len(shader.ByteCode):,}"))
+            
+            # Refresh the details panel
+            self._on_fxc_shader_select(None)
+            
+            messagebox.showinfo("Success", f"Successfully imported CSO data to {shader.Name}.\nDon't forget to Save FXC.")
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Failed to import CSO:\n{e}")
+
+    def _fxc_export(self):
+        if not hasattr(self, 'fxc_current_file') or not self.fxc_current_file: return messagebox.showwarning("Warning", "Open an FXC file first.")
+        
+        sel = self.fxc_shader_tree.selection()
+        if not sel: return messagebox.showwarning("Warning", "Select one or more shaders from the list first.")
+        
+        exported_count = 0
+        g_names = ["VS", "PS", "CS", "DS", "GS", "HS"]
+        fxc_name = os.path.splitext(os.path.basename(self.fxc_current_filepath))[0]
+        base_target_dir = os.path.join(self.dirs["compiled"], "dx11", fxc_name)
+        
+        try:
+            for item in sel:
+                if item not in self.fxc_shader_map:
+                    continue # Might be a category node
+                    
+                shader = self.fxc_shader_map[item]
+                safe_name = shader.Name.replace("\\", "_").replace("/", "_").replace(":", "_")[:80]
+                if not safe_name: safe_name = "shader"
+                
+                # Determine the group folder ("VS", "PS", etc.)
+                group_name = "VS"
+                for i, grp in enumerate(self.fxc_current_file.ShaderGroups):
+                    if shader in grp.Shaders:
+                        group_name = g_names[i]
+                        break
+                        
+                target_dir = os.path.join(base_target_dir, group_name)
+                os.makedirs(target_dir, exist_ok=True)
+                
+                filepath = os.path.join(target_dir, f"{safe_name}.cso")
+                
+                with open(filepath, "wb") as f:
+                    f.write(shader.ByteCode)
+                
+                self._log(f"FXC: Exported {shader.Name} to {filepath}.")
+                exported_count += 1
+                
+            if exported_count > 0:
+                messagebox.showinfo("Success", f"Exported {exported_count} shader(s) to:\n{base_target_dir}")
+            else:
+                messagebox.showwarning("Warning", "No shaders were exported. Did you select a category instead of a shader?")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export CSO:\n{e}")
+
+    def _fxc_save(self):
+        if not hasattr(self, 'fxc_current_file') or not self.fxc_current_file: return messagebox.showwarning("Warning", "No FXC loaded.")
+        
+        filepath = filedialog.asksaveasfilename(title="Save FXC", initialfile=os.path.basename(self.fxc_current_filepath), defaultextension=".fxc", filetypes=[("FXC Files", "*.fxc"), ("All Files", "*.*")])
+        if not filepath: return
+        
+        try:
+            self._log(f"Saving FXC to {filepath}...")
+            
+            # Create backup if overwriting existing file
+            if os.path.exists(filepath):
+                backup_dir = os.path.join(os.path.dirname(filepath), "backups")
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, os.path.basename(filepath) + ".bak")
+                shutil.copy2(filepath, backup_path)
+            
+            with open(filepath, 'wb') as f: 
+                f.write(self.fxc_current_file.save())
+                
+            self.fxc_status_var.set(f"Saved: {os.path.basename(filepath)}")
+            messagebox.showinfo("Success", f"Successfully saved FXC file:\n{filepath}")
+            self._log("FXC saved successfully.")
+            
+            # Update the file size in the left tree if we saved to the same directory
+            self.refresh_fxc_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save FXC:\n{e}")
+            self._log(f"FXC Save Error: {e}")
+
+    def _init_awc_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["awc"] = page
+        self.awc_file = None
+        self.awc_current_shader = None
+        
+        # --- Info Banner ---
+        banner = ttk.Frame(page, padding=10, bootstyle="danger")
+        banner.pack(fill=X, pady=(0, 10))
+        ttk.Label(banner, text="📦  GTA 5 Enhanced — DX12 Archives", font=("Segoe UI", 10, "bold"), bootstyle="inverse-danger").pack(side=LEFT, padx=(0, 10))
+        ttk.Label(banner, text="This tab is for GTA 5 Enhanced (new version). Open an .awc shader library, select a shader, export it, decompile and edit, recompile, then import it back and save. Use 'Compile & Decompile' (DX12 mode) for the editing step.", wraplength=900, bootstyle="inverse-danger").pack(side=LEFT, fill=X, expand=True)
+        
+
+        tools = ttk.Frame(page)
+        tools.pack(fill=X, pady=(0, 10))
+        
+        btn_awc_open = ttk.Button(tools, text="📂 Open .awc File", command=self._awc_open, bootstyle="info")
+        btn_awc_open.pack(side=LEFT, padx=(0, 5))
+        hint(btn_awc_open, "Open an .awc shader library from disk.\nFiles in /awc_files/ are listed on the left.")
+        btn_awc_save = ttk.Button(tools, text="💾 Save .awc As...", command=self._awc_save, bootstyle="success")
+        btn_awc_save.pack(side=LEFT, padx=(0, 15))
+        hint(btn_awc_save, "Rebuild and save the loaded AWC file.\nUse after importing modified shader bytecode.")
+        
+        btn_awc_imp = ttk.Button(tools, text="📥 Import CSO", command=self._awc_import, bootstyle="warning")
+        btn_awc_imp.pack(side=LEFT, padx=(0, 5))
+        hint(btn_awc_imp, "Replace the selected shader's bytecode\nwith a compiled .cso file from disk.\nRemember to Save AWC afterwards.")
+        btn_awc_exp = ttk.Button(tools, text="📤 Export CSO", command=self._awc_export, bootstyle="secondary")
+        btn_awc_exp.pack(side=LEFT, padx=(0, 5))
+        hint(btn_awc_exp, "Export the selected shader's binary\nas a .cso file to disk.")
+        btn_awc_dec = ttk.Button(tools, text="▼ Decompile to HLSL", command=self._awc_decompile, bootstyle="primary")
+        btn_awc_dec.pack(side=LEFT)
+        hint(btn_awc_dec, "Decompile the selected shader to .hlsl source code\nusing decomp.exe. This also restores any extra\nshader info/metadata previously hidden.")
+        
+        # Metadata update toggle - OFF by default (metadata rebuild can cause crashes)
+        self.awc_update_metadata_var = tk.BooleanVar(value=False)
+        chk_meta = ttk.Checkbutton(tools, text="Update Metadata", variable=self.awc_update_metadata_var, bootstyle="round-toggle-warning")
+        chk_meta.pack(side=LEFT, padx=(15, 0))
+        hint(chk_meta, "When ON, shader metadata (registers, sizes)\nis recalculated on import. Leave OFF unless\nyou know what you're doing — can cause crashes.")
+        
+        btn_awc_ref = ttk.Button(tools, text="⟳ Refresh", command=self.refresh_all, bootstyle="link")
+        btn_awc_ref.pack(side=RIGHT)
+        hint(btn_awc_ref, "Reload all file lists.")
+        
+        self.awc_status_var = tk.StringVar(value="Ready — No AWC loaded")
+        ttk.Label(tools, textvariable=self.awc_status_var, bootstyle="secondary-inverse", padding=(5, 2)).pack(side=RIGHT, padx=10)
+
+        panes = ttk.PanedWindow(page, orient=HORIZONTAL)
+        panes.pack(fill=BOTH, expand=True)
+        
+        # LEFT: AWC Files in Workspace
+        files_fr = ttk.Labelframe(panes, text=" AWC Files in /awc_files/ ", padding=5)
+        panes.add(files_fr, weight=1)
+        
+        cols_f = ("size", "path")
+        file_container, self.awc_file_tree = self._create_scrolled_tree(files_fr, columns=cols_f, show="headings", bootstyle="primary")
+        file_container.pack(fill=BOTH, expand=True)
+        self.awc_file_tree.heading("size", text="Size")
+        self.awc_file_tree.column("size", width=80, anchor="e")
+        self.awc_file_tree.heading("path", text="Filename")
+        self.awc_file_tree.column("path", width=200)
+        self.awc_file_tree.bind("<<TreeviewSelect>>", self._on_awc_file_select)
+        
+        # MIDDLE: Shaders inside AWC
+        middle_fr = ttk.Frame(panes)
+        panes.add(middle_fr, weight=2)
+        
+        search_fr = ttk.Frame(middle_fr)
+        search_fr.pack(fill=X, pady=(0, 5))
+        ttk.Label(search_fr, text="🔍 Filter:", font=("Segoe UI", 9)).pack(side=LEFT, padx=(0, 5))
+        self.awc_search_var = tk.StringVar()
+        self.awc_search_var.trace_add("write", lambda *args: self._awc_populate_tree())
+        ttk.Entry(search_fr, textvariable=self.awc_search_var).pack(side=LEFT, fill=X, expand=True)
+        
+        self.awc_group_technique_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(search_fr, text="Group by Technique ID", variable=self.awc_group_technique_var, command=self._awc_populate_tree, bootstyle="round-toggle-info").pack(side=LEFT, padx=(10, 0))
+        
+        cols_s = ("type", "size")
+        tree_container, self.awc_tree = self._create_scrolled_tree(middle_fr, columns=cols_s, show="tree headings", bootstyle="info")
+        tree_container.pack(fill=BOTH, expand=True)
+        
+        self.awc_tree.heading("#0", text="Shader Hash / Name", anchor="w")
+        self.awc_tree.heading("type", text="Type", anchor="w")
+        self.awc_tree.heading("size", text="Size (Bytes)", anchor="e")
+        self.awc_tree.column("#0", width=250)
+        self.awc_tree.column("type", width=80)
+        self.awc_tree.column("size", width=100, anchor="e")
+        self.awc_tree.bind("<<TreeviewSelect>>", self._on_awc_select)
+        
+        details_fr = ttk.Labelframe(panes, text=" Shader Details ", padding=10)
+        panes.add(details_fr, weight=1)
+        
+        self.awc_details = tk.Text(details_fr, font=("Consolas", 10), bg="#002b36", fg="#93a1a1", bd=0, wrap="word")
+        self.awc_details.pack(fill=BOTH, expand=True)
+        self.awc_details.insert(tk.END, "Select a shader to view\nregister bindings and metadata.")
+        self.awc_details.config(state=tk.DISABLED)
+
+    def _awc_open(self):
+        filepath = filedialog.askopenfilename(title="Open AWC Shader Library", filetypes=[("AWC Files", "*.awc"), ("All Files", "*.*")])
+        if not filepath: return
+        self._load_awc_file(filepath)
+
+    def _on_awc_file_select(self, event):
+        sel = self.awc_file_tree.selection()
+        if not sel: return
+        tags = self.awc_file_tree.item(sel[0], "tags")
+        if tags and len(tags) > 0:
+            filepath = tags[0]
+            if os.path.exists(filepath):
+                self._load_awc_file(filepath)
+                
+    def _load_awc_file(self, filepath):
+        try:
+            self._log(f"Parsing AWC: {os.path.basename(filepath)}...")
+            self.awc_file = parse_awc_file(filepath)
+            
+            # Keep track of active AWC path to easily save within workspace
+            self.awc_current_filepath = filepath
+            
+            self.awc_status_var.set(f"Loaded: {os.path.basename(filepath)}")
+            self._awc_populate_tree()
+            self._log(f"Successfully loaded {self.awc_file.total_shader_count} shaders from AWC.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to parse AWC:\n{e}")
+            self._log(f"AWC Parse Error: {e}")
+
+    @staticmethod
+    def _extract_technique_id(name):
+        """Extract hex technique ID from shader name (e.g. '7903a05e' from 'VS_Transform_7903a05e_Wrapped')."""
+        import re
+        match = re.search(r'(?:_| )([0-9a-fA-F]{6,16})(?:_| |$)', name)
+        return match.group(1).lower() if match else None
+
+    def _awc_populate_tree(self):
+        self.awc_tree.delete(*self.awc_tree.get_children())
+        if not self.awc_file: return
+        
+        search_term = ""
+        if hasattr(self, 'awc_search_var'):
+            search_term = self.awc_search_var.get().lower()
+        
+        group_by_technique = hasattr(self, 'awc_group_technique_var') and self.awc_group_technique_var.get()
+        
+        categories = [
+            ("Vertex Shaders", self.awc_file.vertex_shaders, "VS"),
+            ("Pixel Shaders", self.awc_file.pixel_shaders, "PS"),
+            ("Compute Shaders", self.awc_file.compute_shaders, "CS"),
+            ("Geometry Shaders", self.awc_file.geometry_shaders, "GS"),
+            ("Hull Shaders", self.awc_file.hull_shaders, "HS"),
+            ("Domain Shaders", self.awc_file.domain_shaders, "DS")
+        ]
+        
+        self.awc_shader_map = {}
+        
+        if group_by_technique:
+            # Collect all shaders with their types, filtered by search
+            all_shaders = []
+            for cat_name, shaders, sh_type in categories:
+                for s in shaders:
+                    if search_term in s.name.lower() or search_term in f"0x{s.hash:016x}":
+                        all_shaders.append((s, sh_type))
+            
+            # Group by technique ID
+            from collections import OrderedDict
+            technique_groups = OrderedDict()
+            ungrouped = []
+            for s, sh_type in all_shaders:
+                tech_id = self._extract_technique_id(s.name)
+                if tech_id:
+                    if tech_id not in technique_groups:
+                        technique_groups[tech_id] = []
+                    technique_groups[tech_id].append((s, sh_type))
+                else:
+                    ungrouped.append((s, sh_type))
+            
+            # Insert grouped shaders
+            for tech_id, group in technique_groups.items():
+                types_in_group = set(t for _, t in group)
+                type_summary = "/".join(sorted(types_in_group))
+                group_id = self.awc_tree.insert("", "end", text=f"🔗 Technique {tech_id} ({len(group)} shaders)", values=(type_summary, ""), open=True)
+                for s, sh_type in group:
+                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    self.awc_shader_map[item_id] = s
+            
+            # Insert ungrouped shaders
+            if ungrouped:
+                misc_id = self.awc_tree.insert("", "end", text=f"Ungrouped ({len(ungrouped)})", values=("", ""), open=True)
+                for s, sh_type in ungrouped:
+                    item_id = self.awc_tree.insert(misc_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    self.awc_shader_map[item_id] = s
+        else:
+            # Default: group by shader type category
+            for cat_name, shaders, sh_type in categories:
+                if not shaders: continue
+                
+                filtered = []
+                for s in shaders:
+                    if search_term in s.name.lower() or search_term in f"0x{s.hash:016x}":
+                        filtered.append(s)
+                        
+                if not filtered: continue
+                
+                cat_id = self.awc_tree.insert("", "end", text=f"{cat_name} ({len(filtered)})", values=("", ""), open=True)
+                for s in filtered:
+                    item_id = self.awc_tree.insert(cat_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    self.awc_shader_map[item_id] = s
+
+    def _on_awc_select(self, event):
+        sel = self.awc_tree.selection()
+        if not sel: return
+        item_id = sel[0]
+        shader = self.awc_shader_map.get(item_id)
+        if shader:
+            self.awc_current_shader = shader
+            
+            details = f"Name: {shader.name}\n"
+            details += f"Hash: 0x{shader.hash:016X}\n"
+            details += f"Binary Size: {shader.size:,} bytes\n"
+            wavesize_desc = {50: "Wave32", 65: "Wave64 (preferred)", 66: "Wave64 (required)"}.get(shader.wavesize, f"Unknown")
+            details += f"Wave Size: {wavesize_desc} (0x{shader.wavesize:02X})\n"
+            from awclib.models import ResourceType
+            tex_count = sum(1 for r in shader.registers if ResourceType.get_register_prefix(r.resource_type) == "t")
+            sampler_count = sum(1 for r in shader.registers if ResourceType.get_register_prefix(r.resource_type) == "s")
+            cbv_count = sum(1 for r in shader.registers if ResourceType.get_register_prefix(r.resource_type) == "b")
+            uav_count = sum(1 for r in shader.registers if ResourceType.get_register_prefix(r.resource_type) == "u")
+            details += f"Registers: {shader.reg_count} | CBVs: {cbv_count} | Textures: {tex_count} | Samplers: {sampler_count} | UAVs: {uav_count}\n"
+            details += "="*40 + "\n"
+            
+            for reg in shader.registers:
+                prefix = ResourceType.get_register_prefix(reg.resource_type)
+                res_type_name = ResourceType.get_name(reg.resource_type)
+                
+                binding = f"{prefix}{reg.register_slot}"
+                if reg.register_space > 0: binding += f", space{reg.register_space}"
+                
+                desc = f"Register [{binding}]: {reg.reg_name} ({res_type_name})"
+                if prefix == "b": desc += f" (CBs: {reg.cbuffer_count})"
+                details += f"{desc}\n"
+                for cb in reg.cbuffers:
+                    details += f"   ► {cb.type_name} {cb.cbuffer_name}[{cb.array_size}]\n"
+                
+            self.awc_details.config(state=tk.NORMAL)
+            self.awc_details.delete("1.0", tk.END)
+            self.awc_details.insert(tk.END, details)
+            self.awc_details.config(state=tk.DISABLED)
+        else:
+            self.awc_current_shader = None
+            self.awc_details.config(state=tk.NORMAL)
+            self.awc_details.delete("1.0", tk.END)
+            self.awc_details.config(state=tk.DISABLED)
+
+    def _awc_import(self):
+        if not self.awc_file: return messagebox.showwarning("Warning", "Open an AWC file first.")
+        if not self.awc_current_shader: return messagebox.showwarning("Warning", "Select a shader from the list first.")
+        
+        shader = self.awc_current_shader
+        filepath = filedialog.askopenfilename(title=f"Import CSO for {shader.name}", initialdir=self._get_current_dir("compiled"), filetypes=[("Compiled Shaders", "*.cso"), ("All Files", "*.*")])
+        if not filepath: return
+        
+        try:
+            from awclib.awc_writer import import_shader
+            
+            # Find shader type and index
+            type_map = {
+                'vertex': self.awc_file.vertex_shaders,
+                'pixel': self.awc_file.pixel_shaders,
+                'geometry': self.awc_file.geometry_shaders,
+                'domain': self.awc_file.domain_shaders,
+                'hull': self.awc_file.hull_shaders,
+                'compute': self.awc_file.compute_shaders,
+            }
+            
+            shader_type = None
+            shader_index = None
+            for stype, slist in type_map.items():
+                for i, s in enumerate(slist):
+                    if s is shader:
+                        shader_type = stype
+                        shader_index = i
+                        break
+                if shader_type: break
+            
+            if shader_type is None:
+                messagebox.showerror("Error", "Could not find shader in AWC file.")
+                return
+            
+            success, msg = import_shader(self.awc_file, shader_type, shader_index, filepath, 
+                                         update_metadata=self.awc_update_metadata_var.get())
+            
+            if success:
+                messagebox.showinfo("Success", f"{msg}\nDon't forget to Save AWC.")
+                self._log(f"AWC: {msg}")
+            else:
+                messagebox.showerror("Error", f"Import failed:\n{msg}")
+                return
+            
+            # Refresh the tree item size
+            sel = self.awc_tree.selection()
+            if sel:
+                vals = self.awc_tree.item(sel[0], "values")
+                if vals:
+                    self.awc_tree.item(sel[0], values=(vals[0], f"{shader.size:,}"))
+            
+            # Refresh the details panel
+            self._on_awc_select(None)
+                    
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Failed to import CSO:\n{e}")
+
+    def _awc_export(self):
+        if not self.awc_file: return messagebox.showwarning("Warning", "Open an AWC file first.")
+        if not self.awc_current_shader: return messagebox.showwarning("Warning", "Select a shader from the list first.")
+        
+        shader = self.awc_current_shader
+        safe_name = shader.name.replace("\\", "_").replace("/", "_").replace(":", "_")[:80]
+        filepath = filedialog.asksaveasfilename(title=f"Export {safe_name} as CSO", initialdir=self._get_current_dir("compiled"), defaultextension=".cso", initialfile=f"{safe_name}.cso", filetypes=[("Compiled Shaders", "*.cso"), ("All Files", "*.*")])
+        if not filepath: return
+        
+        try:
+            with open(filepath, "wb") as f:
+                f.write(shader.shader_binary)
+            self._log(f"AWC: Exported {shader.name} to CSO.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export CSO:\n{e}")
+
+    def _awc_save(self):
+        if not self.awc_file: return messagebox.showwarning("Warning", "No AWC loaded.")
+        
+        filepath = filedialog.asksaveasfilename(title="Save AWC Shader Library", defaultextension=".awc", filetypes=[("AWC Files", "*.awc"), ("All Files", "*.*")])
+        if not filepath: return
+        
+        try:
+            self._log(f"Rebuilding AWC to {filepath}...")
+            writer = AWCRebuilder(self.awc_file, self.awc_current_filepath)
+            writer.write(filepath)
+            self.awc_status_var.set(f"Saved: {os.path.basename(filepath)}")
+            messagebox.showinfo("Success", f"Successfully saved rebuild AWC file:\n{filepath}")
+            self._log("AWC saved successfully.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to rebuild AWC:\n{e}")
+            self._log(f"AWC Save Error: {e}")
+
+    def _awc_decompile(self):
+        if not self.awc_file: return messagebox.showwarning("Warning", "Open an AWC file first.")
+        if not self.awc_current_shader: return messagebox.showwarning("Warning", "Select a shader from the list first.")
+        
+        shader = self.awc_current_shader
+        out_dir = self._get_current_dir("decompiled")
+        tools_dir = self.dirs.get("compilers", "")
+        
+        self._log(f"AWC: Decompiling {shader.name}...")
+        
+        def run_decomp():
+            success, msg, out_path = decompile_shader(shader, out_dir, tools_dir)
+            self.root.after(0, self._awc_decompile_done, success, msg, out_path)
+            
+        threading.Thread(target=run_decomp, daemon=True).start()
+
+    def _awc_decompile_done(self, success, msg, out_path):
+        if success:
+            self._log(f"AWC Decompile Success: {msg}")
+            
+            # Show ASM/HLSL window like the normal dev page does
+            if out_path and os.path.exists(out_path):
+                with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                AsmWindow(self.root, os.path.basename(out_path), content)
+        else:
+            self._log(f"AWC Decompile Failed: {msg}")
+            messagebox.showerror("Decompile Error", msg)
+
+    # --- HELPERS ---
+    def _select_all(self, tree):
+        items = []
+        for child in tree.get_children():
+            items.append(child)
+            children = tree.get_children(child)
+            if children: 
+                tree.item(child, open=True)
+                items.extend(children)
+        if items:
+            tree.selection_set(items)
+
+    def _get_type_folder(self, prof):
+        p = prof.lower()
+        if p.startswith("vs") or "_vs" in p or "+vs" in p: return "VS"
+        if p.startswith("ps") or "_ps" in p or "+ps" in p: return "PS"
+        if p.startswith("cs") or "_cs" in p or "+cs" in p: return "CS"
+        if p.startswith("ds") or "_ds" in p or "+ds" in p: return "DS"
+        if p.startswith("gs") or "_gs" in p or "+gs" in p: return "GS"
+        if p.startswith("hs") or "_hs" in p or "+hs" in p: return "HS"
+        return "Misc"
+
+    def _detect_profile(self, path):
+        # Check filename for explicit profile (e.g. .vs_6_0.hlsl, .ps_6_5.hlsl, .ps_6_6.hlsl)
+        fn = os.path.basename(path).lower()
+        # SM 6.6
+        if "vs_6_6" in fn: return "vs_6_6"
+        if "ps_6_6" in fn: return "ps_6_6"
+        if "cs_6_6" in fn: return "cs_6_6"
+        if "gs_6_6" in fn: return "gs_6_6"
+        if "ds_6_6" in fn: return "ds_6_6"
+        if "hs_6_6" in fn: return "hs_6_6"
+        # SM 6.5
+        if "vs_6_5" in fn: return "vs_6_5"
+        if "ps_6_5" in fn: return "ps_6_5"
+        if "cs_6_5" in fn: return "cs_6_5"
+        if "gs_6_5" in fn: return "gs_6_5"
+        if "ds_6_5" in fn: return "ds_6_5"
+        if "hs_6_5" in fn: return "hs_6_5"
+        # SM 6.0
+        if "vs_6_0" in fn: return "vs_6_0"
+        if "ps_6_0" in fn: return "ps_6_0"
+        if "cs_6_0" in fn: return "cs_6_0"
+        if "gs_6_0" in fn: return "gs_6_0"
+        if "ds_6_0" in fn: return "ds_6_0"
+        if "hs_6_0" in fn: return "hs_6_0"
+        
+        folder = os.path.basename(os.path.dirname(path)).upper()
+        if folder == "VS": return "vs_5_0"
+        if folder == "PS": return "ps_5_0"
+        if folder == "CS": return "cs_5_0"
+        if folder == "DS": return "ds_5_0"
+        if folder == "GS": return "gs_5_0"
+        if folder == "HS": return "hs_5_0"
+        
+        if fn.startswith("vs") or "_vs" in fn or "+vs" in fn or ".vsh" in fn: return "vs_5_0"
+        if fn.startswith("ps") or "_ps" in fn or "+ps" in fn or ".psh" in fn: return "ps_5_0"
+        if fn.startswith("cs") or "_cs" in fn or "+cs" in fn or ".csh" in fn: return "cs_5_0"
+        if fn.startswith("ds") or "_ds" in fn: return "ds_5_0"
+        if fn.startswith("gs") or "_gs" in fn: return "gs_5_0"
+        if fn.startswith("hs") or "_hs" in fn: return "hs_5_0"
+        if fn.startswith("hs") or "_hs" in fn: return "hs_5_0"
+        
+        # Fallback: detect shader type from file content
+        content_type = self._detect_shader_type_content(path)
+        ver = "6_0" if self.dx_version.get() == "dx12" else "5_0"
+        if content_type == "[VS]": return f"vs_{ver}"
+        if content_type == "[PS]": return f"ps_{ver}"
+        return "ps_5_0"
+
+    def _detect_shader_type_content(self, path):
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Heuristic from compile_shaders.py
+            if "SV_Position" in content and "SV_Target" in content:
+                if re.search(r'out\s+[\w\d\s]+\s*:\s*SV_Position', content, re.IGNORECASE):
+                    return "[VS]"
+                if re.search(r':\s*SV_Position', content) and not re.search(r'out\s+.*SV_Position', content):
+                     if re.search(r':\s*SV_Target', content) or re.search(r'out\s+.*SV_Target', content):
+                         return "[PS]"
+            
+            if "SV_Position" in content and "SV_Target" not in content:
+                if re.search(r'out\s+[\w\d\s]+\s*:\s*SV_Position', content, re.IGNORECASE):
+                     return "[VS]"
+            
+            if "SV_Target" in content:
+                return "[PS]"
+
+            if "out float4 o5 : SV_Position0" in content:
+                return "[VS]"
+                
+        except: pass
+        return ""
+
+    def _log(self, txt): self.msg_queue.put(("LOG", txt))
+    
+    def _process_queue(self):
+        try:
+            while True:
+                kind, data = self.msg_queue.get_nowait()
+                if kind == "LOG":
+                    self.log_widget.config(state=tk.NORMAL)
+                    ts = time.strftime("[%H:%M:%S] ")
+                    self.log_widget.insert(END, ts, "ts")
+                    self.log_widget.insert(END, data + "\n")
+                    self.log_widget.tag_config("ts", foreground="#586e75")
+                    self.log_widget.see(END)
+                    self.log_widget.config(state=tk.DISABLED)
+                elif kind == "P_START":
+                    self.progress['maximum'] = data; self.progress['value'] = 0
+                    self.status_badge.config(text="Processing...", bootstyle="warning-inverse")
+                    self.is_processing = True
+                elif kind == "P_STEP": self.progress['value'] += 1
+                elif kind == "P_STOP": 
+                    self.progress['value'] = 0
+                    self.status_badge.config(text="Ready", bootstyle="success-inverse")
+                    self.is_processing = False
+                elif kind == "REFRESH": self.refresh_all()
+        except queue.Empty: pass
+        self.root.after(100, self._process_queue)
+
+    def refresh_all(self):
+        self.refresh_source()
+        self.refresh_compiled()
+        self.refresh_fxc_list()
+        self.refresh_awc_list()
+        
+    def refresh_awc_list(self):
+        if not hasattr(self, 'awc_file_tree'): return
+        self.awc_file_tree.delete(*self.awc_file_tree.get_children())
+        d = self.dirs.get("awc", "")
+        if os.path.exists(d):
+            for f in os.listdir(d):
+                if f.lower().endswith(".awc"):
+                    path = os.path.join(d, f)
+                    sz = f"{os.path.getsize(path)/1024/1024:.2f} MB"
+                    self.awc_file_tree.insert("", "end", values=(sz, f), tags=(path,))
+
+    def _on_dx_change(self):
+        ver = self.dx_version.get()
+        if ver == "dx12":
+            self.btn_fxc.pack_forget()
+            if hasattr(self, 'btn_awc'):
+                self.btn_awc.pack(fill=X, pady=2, after=self.btn_dev)
+                
+            if hasattr(self, 'fr_decomp_method') and hasattr(self, 'sep_view_mode'):
+                self.fr_decomp_method.pack(side=LEFT, before=self.sep_view_mode, padx=(0, 10))
+            
+            if self.current_page == "fxc":
+                self._show_page("dev")
+        else:
+            if hasattr(self, 'btn_awc'):
+                self.btn_awc.pack_forget()
+            self.btn_fxc.pack(fill=X, pady=2, after=self.btn_dev)
+            
+            if hasattr(self, 'fr_decomp_method'):
+                self.fr_decomp_method.pack_forget()
+                
+            if self.current_page == "awc":
+                self._show_page("dev")
+        self.refresh_all()
+
+    def refresh_source(self):
+        self.src_tree.delete(*self.src_tree.get_children())
+        self._filter_source()
+
+    def _filter_source(self, *args):
+        self.src_tree.delete(*self.src_tree.get_children())
+        search = self.search_var.get().lower()
+        mode = self.source_mode_var.get()
+        root = self._get_current_dir("source") if mode == "source" else self._get_current_dir("decompiled")
+        
+        groups = {}
+        for dp, _, fn in os.walk(root):
+            if ".git" in dp or "__pycache__" in dp: continue
+            for f in sorted(fn):
+                if f.endswith(".hlsl"):
+                    if search and search not in f.lower(): continue
+                    full = os.path.join(dp, f)
+                    rel_path = os.path.relpath(dp, root)
+                    if rel_path == ".":
+                        parts = f.split('+')
+                        if len(parts) >= 3: 
+                            grp = parts[1]
+                            name = f"[{parts[0]}] {'+'.join(parts[2:])}"
+                        elif len(parts) == 2:
+                            grp = parts[0]
+                            name = parts[1]
+                        else:
+                            grp = "Misc"
+                            name = f
+                    else:
+                        grp = rel_path
+                        parts = f.split('+')
+                        if len(parts) >= 2 and (parts[0].isalnum() or parts[0] in self.hash_map):
+                            name = f"[{parts[0]}] {'+'.join(parts[1:])}"
+                        else:
+                            name = f
+                    
+                    # Detect shader type if not explicitly known from filename/folder
+                    # (only if we didn't already determine it's a VS/PS etc from the filename, but even then, content check is more robust for 0x files)
+                    # Let's add the tag.
+                    type_tag = self._detect_shader_type_content(full)
+                    if type_tag:
+                         name = f"{type_tag} {name}"
+
+                    tags = (full,)
+                    if grp not in groups: 
+                        groups[grp] = self.src_tree.insert("", "end", text=f" 📂 {grp}", open=True)
+                    icon = "⚡" if mode == "source" else "📄"
+                    self.src_tree.insert(groups[grp], "end", text=f"   {icon} {name}", tags=tags)
+
+    def refresh_compiled(self):
+        self.cmp_tree.delete(*self.cmp_tree.get_children())
+        root = self._get_current_dir("compiled")
+        groups = {}
+        for dp, _, fn in os.walk(root):
+            grp = os.path.relpath(dp, root)
+            if grp == ".": grp = "Root"
+            
+            # Create group if files exist or it's a subdirectory (not checking files yet, but good to have groups)
+            # Actually, let's only create group if there are matching files to avoid empty folders clunk
+            has_cso = any(f.endswith(".cso") for f in fn)
+            if has_cso:
+                if grp not in groups: 
+                    groups[grp] = self.cmp_tree.insert("", "end", text=f" 📁 {grp}", open=True)
+                
+                for f in sorted(fn):
+                    if f.endswith(".cso"):
+                        self.cmp_tree.insert(groups[grp], "end", text=f"   ⚙ {f}", tags=(os.path.join(dp, f),))
+
+    def refresh_fxc_list(self):
+        self.fxc_tree.delete(*self.fxc_tree.get_children())
+        d = self.dirs["fxc"]
+        if os.path.exists(d):
+            search_term = ""
+            if hasattr(self, 'fxc_search_var'):
+                search_term = self.fxc_search_var.get().lower()
+                
+            items_to_parse = []
+            for f in os.listdir(d):
+                if f.lower().endswith(".fxc"):
+                    if search_term and search_term not in f.lower(): continue
+                    path = os.path.join(d, f)
+                    sz = f"{os.path.getsize(path)/1024:.1f} KB"
+                    item_id = self.fxc_tree.insert("", "end", values=(sz, "...", f), tags=(path,))
+                    items_to_parse.append((item_id, path))
+                    
+            if items_to_parse:
+                threading.Thread(target=self._worker_parse_fxc_counts, args=(items_to_parse,), daemon=True).start()
+
+    def _worker_parse_fxc_counts(self, items):
+        for item_id, path in items:
+            try:
+                with open(path, 'rb') as f: data = f.read()
+                fxc = fxc_parser.FxcFile()
+                fxc.load(data)
+                
+                count = 0
+                for grp in fxc.ShaderGroups:
+                    if grp.Shaders:
+                        count += len(grp.Shaders)
+                        
+                # UI update thread safe
+                self.root.after(0, lambda i=item_id, c=count: self._update_fxc_count(i, c))
+            except Exception: pass
+            
+    def _update_fxc_count(self, item_id, count):
+        if self.fxc_tree.exists(item_id):
+            vals = self.fxc_tree.item(item_id, "values")
+            if vals:
+                self.fxc_tree.item(item_id, values=(vals[0], f"{count:,}", vals[2]))
+
+    def _open_src_file(self, event):
+        item = self.src_tree.identify_row(event.y)
+        if item:
+            tags = self.src_tree.item(item, "tags")
+            if tags:
+                self.ctx_item_tags = tags
+                self._open_editor()
+
+    def _ctx_menu(self, event, tree, mtype):
+        item = tree.identify_row(event.y)
+        if item:
+            tags = tree.item(item, "tags")
+            if tags:
+                tree.selection_set(item)
+                self.ctx_item_tags = tags
+                menu = self.ctx_src if mtype == "src" else self.ctx_cmp
+                menu.post(event.x_root, event.y_root)
+
+    def _ctx_open_folder(self):
+        if hasattr(self, 'ctx_item_tags'):
+            subprocess.Popen(f'explorer /select,"{os.path.abspath(self.ctx_item_tags[0])}"')
+
+    def _open_editor(self):
+        if hasattr(self, 'ctx_item_tags'):
+            path = os.path.abspath(self.ctx_item_tags[0])
+        else:
+            sel = self.src_tree.selection()
+            if not sel: return
+            tags = self.src_tree.item(sel[0], "tags")
+            if not tags: return
+            path = os.path.abspath(tags[0])
+        ed = self.config["Paths"]["editor_path"]
+        if ed and os.path.exists(ed): subprocess.Popen([ed, path])
+        else: os.startfile(path)
+
+    def organize_source_files(self):
+        src_dir = self._get_current_dir("source")
+        moves = []
+        count = 0
+        self._log("Analyzing files for reorganization...")
+        for root, _, files in os.walk(src_dir):
+            for f in files:
+                if not f.endswith(".hlsl"): continue
+                parts = f.split('+')
+                group = None
+                new_filename = f
+                if len(parts) >= 3: 
+                    group = parts[1]
+                    new_filename = f"{parts[0]}+{'+'.join(parts[2:])}"
+                elif len(parts) == 2: 
+                    group = parts[0]
+                    new_filename = parts[1]
+                if not group: continue
+                lower_f = f.lower()
+                sh_type = "Misc"
+                if any(x in lower_f for x in ["_vs", "+vs", "vsh"]): sh_type = "VS"
+                elif any(x in lower_f for x in ["_ps", "+ps", "psh"]): sh_type = "PS"
+                elif any(x in lower_f for x in ["_cs", "+cs", "csh"]): sh_type = "CS"
+                elif any(x in lower_f for x in ["_ds", "+ds", "dsh"]): sh_type = "DS"
+                elif any(x in lower_f for x in ["_gs", "+gs", "gsh"]): sh_type = "GS"
+                elif any(x in lower_f for x in ["_hs", "+hs", "hsh"]): sh_type = "HS"
+                target_folder = os.path.join(src_dir, group, sh_type)
+                current_path = os.path.join(root, f)
+                target_path = os.path.join(target_folder, new_filename)
+                if os.path.exists(target_path) and os.path.abspath(current_path) != os.path.abspath(target_path):
+                    self._log(f"Skipping {f}: Destination already exists.")
+                    continue
+                if os.path.abspath(current_path) != os.path.abspath(target_path):
+                    moves.append((current_path, target_folder, target_path))
+        for curr, t_folder, t_path in moves:
+            try:
+                os.makedirs(t_folder, exist_ok=True)
+                shutil.move(curr, t_path)
+                count += 1
+            except Exception as e:
+                self._log(f"Error moving {os.path.basename(curr)}: {e}")
+        if count > 0:
+            self._log(f"Organized and renamed {count} files.")
+            self.refresh_source()
+        else:
+            self._log("No files needed organization.")
+
+    def _toggle_watcher(self):
+        if self.watcher_var.get():
+            self._log("Watcher started.")
+            self.watcher_running = True
+            threading.Thread(target=self._watcher_loop, daemon=True).start()
+        else:
+            self._log("Watcher stopped.")
+            self.watcher_running = False
+
+    def _watcher_loop(self):
+        watched = {}
+        while self.watcher_running:
+            for root, _, files in os.walk(self._get_current_dir("source")):
+                for f in files:
+                    if f.endswith(".hlsl"):
+                        p = os.path.join(root, f)
+                        try:
+                            mt = os.stat(p).st_mtime
+                            if p not in watched: watched[p] = mt
+                            elif mt > watched[p]:
+                                watched[p] = mt
+                                self._log(f"Auto-compile: {f}")
+                                prof = self._detect_profile(p)
+                                self._run_compile([(p, prof)])
+                        except: pass
+            time.sleep(1)
+
+    def compile_async(self):
+        sel = self.src_tree.selection()
+        tasks = []
+        for i in sel:
+            tags = self.src_tree.item(i, "tags")
+            if tags:
+                p = tags[0]
+                prof = self._detect_profile(p)
+                tasks.append((p, prof))
+        if tasks:
+            self.msg_queue.put(("P_START", len(tasks)))
+            threading.Thread(target=self._run_compile, args=(tasks,)).start()
+
+    def _run_compile(self, tasks):
+        for path, prof in tasks:
+            fn = os.path.basename(path)
+            self._log(f"Compiling {fn}...")
+            src_root = self._get_current_dir("source") if self.source_mode_var.get() == "source" else self._get_current_dir("decompiled")
+            try:
+                rel_path = os.path.relpath(path, src_root)
+                rel_dir = os.path.dirname(rel_path)
+            except: rel_dir = ""
+            parts = fn.split('+')
+            out_paths = []
+            shader_hash = None
+            shader_group = None
+            if rel_dir and rel_dir != ".":
+                path_parts = rel_dir.split(os.sep)
+                if len(path_parts) >= 1: shader_group = path_parts[0]
+                if len(parts) >= 2:
+                    potential_hash = parts[0]
+                    if potential_hash in self.hash_map or potential_hash.isalnum():
+                        shader_hash = potential_hash
+            else:
+                if len(parts) >= 3: 
+                    shader_hash = parts[0]
+                    shader_group = parts[1]
+                elif len(parts) == 2: 
+                    shader_group = parts[0]
+            if shader_hash and shader_hash in self.hash_map:
+                self._log(f"  -> Hash identified: {shader_hash}")
+                base_name = os.path.splitext(parts[-1])[0]
+                for g in self.hash_map[shader_hash]:
+                    type_folder = self._get_type_folder(prof)
+                    smart = os.path.join(self._get_current_dir("compiled"), g, type_folder)
+                    if os.path.exists(smart):
+                        out_paths.append(os.path.join(smart, base_name + ".cso"))
+                    else:
+                        simp = os.path.join(self._get_current_dir("compiled"), g)
+                        os.makedirs(simp, exist_ok=True)
+                        out_paths.append(os.path.join(simp, base_name + ".cso"))
+            if shader_group:
+                base_name = os.path.splitext(parts[-1])[0]
+                type_folder = self._get_type_folder(prof)
+                target_dir = os.path.join(self._get_current_dir("compiled"), shader_group, type_folder)
+                if os.path.exists(target_dir):
+                    out_paths.append(os.path.join(target_dir, base_name + ".cso"))
+            if not out_paths:
+                target_dir = os.path.join(self._get_current_dir("compiled"), rel_dir)
+                os.makedirs(target_dir, exist_ok=True)
+                out_name = os.path.splitext(fn)[0] + ".cso"
+                out_paths.append(os.path.join(target_dir, out_name))
+            tmp = os.path.join(self._get_current_dir("compiled"), "_temp.cso")
+            
+            cmd = []
+            if self.dx_version.get() == "dx12":
+                # DX12: dxc.exe -T <profile> -Fo <out> <in>
+                # Also stripping _5_0 and replacing with _6_0 if legacy profile was detected but we are in DX12 mode?
+                # Actually, user requested auto-detection from name. If name has _6_0 it returns _6_0. 
+                # If it returned _5_0 (default), but we are in DX12 mode, should we upgrade? 
+                # Let's trust the profile returned by _detect_profile. 
+                # However, if it IS vs_5_0, dxc might complain if we want SM6. 
+                # Let's assume user properly named files or we force upgrade if mode is dx12 and profile is 5_0?
+                # The user said: "automatic detection... e.g. .vs_6_0.hlsl - vertex shader 6.0 model"
+                # So if they use old names, they might still get 5.0. DXC supports 5.0? Yes, usually.
+                cmd = [self.tools["dxc"], '-T', prof, '-Fo', tmp, path]
+            else:
+                # DX11
+                cmd = [self.tools["fxc"], '/nologo', '/T', prof, '/E', 'main', '/Fo', tmp, path]
+
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True)
+                if res.returncode == 0:
+                    out_paths = list(set(out_paths))
+                    for op in out_paths: 
+                        shutil.copy2(tmp, op)
+                    self._log(f"  -> Success ({len(out_paths)} dests)")
+                else:
+                    self._log(f"  -> Error: {res.stderr}")
+            except Exception as e: self._log(f"  -> Exception: {e}")
+            if os.path.exists(tmp): os.remove(tmp)
+            self.msg_queue.put(("P_STEP", None))
+        self.msg_queue.put(("P_STOP", None))
+        self.msg_queue.put(("REFRESH", None))
+
+    def decompile_async(self):
+        sel = self.cmp_tree.selection()
+        tasks = [self.cmp_tree.item(i, "tags")[0] for i in sel if self.cmp_tree.item(i, "tags")]
+        if tasks:
+            self.msg_queue.put(("P_START", len(tasks)))
+            threading.Thread(target=self._run_decompile, args=(tasks,)).start()
+
+    def _run_decompile(self, tasks):
+        mode = self.dx_version.get()
+        for p in tasks:
+            grp = os.path.relpath(os.path.dirname(p), self._get_current_dir("compiled"))
+            out = os.path.join(self._get_current_dir("decompiled"), grp); os.makedirs(out, exist_ok=True)
+            base = os.path.splitext(os.path.basename(p))[0]
+            
+            try:
+                if mode == "dx11":
+                    # DX11: cmd_Decompiler.exe -D <cso>
+                    subprocess.run([self.tools["decompiler"], '-D', p], capture_output=True, cwd=self.dirs["compilers"])
+                    
+                    # Logic to move generated file (usually created next to input)
+                    src_gen = os.path.join(os.path.dirname(p), base + ".hlsl")
+                    if os.path.exists(src_gen): 
+                        shutil.move(src_gen, os.path.join(out, base + ".hlsl"))
+                
+                elif mode == "dx12":
+                    method = self.decomp_method_var.get()
+                    target_file = os.path.join(out, base + ".hlsl")
+
+                    if method == "decomp":
+                        # Direct decomp.exe usage
+                        self._log(f"Decompiling: {base}.cso (Method: Decomp.exe)")
+                        decomp_cmd = [self.tools["decomp_fallback"], p, target_file]
+                        res_decomp = subprocess.run(decomp_cmd, capture_output=True, text=True, cwd=self.dirs["compilers"])
+
+                        if res_decomp.returncode != 0:
+                             self._log(f"Error (decomp.exe): {res_decomp.stderr}")
+                        else:
+                             self._log(f"Decompiled: {base}.hlsl")
+                             entry_point = self._get_entry_point_dx12(p)
+                             if entry_point and os.path.exists(target_file):
+                                 try:
+                                     with open(target_file, 'r') as f: content = f.read()
+                                     with open(target_file, 'w') as f: 
+                                         f.write(f"// Original Entry Function: {entry_point}\n// Decompiled via decomp.exe\n\n" + content)
+                                 except: pass
+
+                    else:
+                        # SPIR-V Pipeline
+                        # DX12: Two-step pipeline using dxil-spirv + spirv-cross
+                        temp_spv = os.path.join(out, base + ".spv")
+                        
+                        # Detect shader type from filename for spirv-cross stage hint
+                        fn_lower = base.lower()
+                        shader_model = "66"  # Default SM 6.6
+                        
+                        # Step 1: dxil-spirv.exe - Convert DXIL to SPIR-V
+                        self._log(f"Decompiling: {base}.cso (Step 1: DXIL -> SPIR-V)")
+                        dxil_cmd = [
+                            self.tools["dxil_spirv"], p,
+                            "--output", temp_spv,
+                            "--dead-code-eliminate",
+                            "--use-reflection-names",
+                            "--validate"
+                        ]
+                        
+                        res1 = subprocess.run(dxil_cmd, capture_output=True, text=True, cwd=self.dirs["compilers"])
+                        
+                        if res1.returncode != 0 or not os.path.exists(temp_spv):
+                            self._log(f"Error (dxil-spirv): {res1.stderr}")
+                            self.msg_queue.put(("P_STEP", None))
+                            continue
+                        
+                        # Step 2: spirv-cross.exe - Convert SPIR-V to HLSL
+                        self._log(f"Decompiling: {base}.cso (Step 2: SPIR-V -> HLSL)")
+                        
+                        # Try with preferred options first
+                        spirv_cmd = [
+                            self.tools["spirv_cross"], temp_spv,
+                            "--hlsl",
+                            "--shader-model", shader_model,
+                            "--hlsl-enable-16bit-types",
+                            "--hlsl-preserve-structured-buffers",
+                            "--relax-nan-checks",
+                            "--output", target_file
+                        ]
+                        
+                        res2 = subprocess.run(spirv_cmd, capture_output=True, text=True, cwd=self.dirs["compilers"])
+                        
+                        # If failed, retry without --hlsl-preserve-structured-buffers (helps with complex cbuffer layouts)
+                        if res2.returncode != 0:
+                            self._log(f"Retrying with fallback options...")
+                            spirv_cmd_fallback = [
+                                self.tools["spirv_cross"], temp_spv,
+                                "--hlsl",
+                                "--shader-model", shader_model,
+                                "--hlsl-enable-16bit-types",
+                                "--relax-nan-checks",
+                                "--output", target_file
+                            ]
+                            res2 = subprocess.run(spirv_cmd_fallback, capture_output=True, text=True, cwd=self.dirs["compilers"])
+                        
+                        # Clean up temp SPIR-V file
+                        if os.path.exists(temp_spv):
+                            os.remove(temp_spv)
+                        
+                        if res2.returncode != 0:
+                            self._log(f"Error (spirv-cross): {res2.stderr}")
+                        else:
+                            self._log(f"Decompiled: {base}.hlsl")
+                            
+                            # Add entry point info as comment
+                            entry_point = self._get_entry_point_dx12(p)
+                            if entry_point and os.path.exists(target_file):
+                                try:
+                                    with open(target_file, 'r') as f: content = f.read()
+                                    with open(target_file, 'w') as f: 
+                                        f.write(f"// Original Entry Function: {entry_point}\n// Decompiled via dxil-spirv + spirv-cross\n\n" + content)
+                                except Exception as e:
+                                    self._log(f"Warning: Could not add header: {e}")
+                    
+            except Exception as e: 
+                self._log(f"Decompile Exception: {e}")
+                print(e)
+            self.msg_queue.put(("P_STEP", None))
+        self.msg_queue.put(("P_STOP", None))
+        self.msg_queue.put(("REFRESH", None))
+
+    def _get_entry_point_dx12(self, cso_path):
+        try:
+            # Run dxc -dumpbin to get ASM/Headers
+            cmd = [self.tools["dxc"], '-dumpbin', cso_path]
+            res = subprocess.run(cmd, capture_output=True, text=True, errors='ignore')
+            if res.returncode != 0: return None
+            
+            # Look for "Entry function: Name"
+            # Pattern might vary, assuming "Entry function: <name>" or similar
+            import re
+            match = re.search(r"Entry function:\s*(\w+)", res.stdout, re.IGNORECASE)
+            if match: return match.group(1)
+            
+            # Fallback: sometimes it's just in the textual representation
+            # "define void @Main(" -> Main
+            match = re.search(r"define\s+\w+\s+@(\w+)\(", res.stdout)
+            if match: return match.group(1)
+            
+        except Exception: pass
+        return None
+
+    def unpack_fxc(self):
+        sel = self.fxc_tree.selection()
+        tasks = [self.fxc_tree.item(i, "tags")[0] for i in sel]
+        if tasks:
+            self.msg_queue.put(("P_START", len(tasks)))
+            threading.Thread(target=self._worker_unpack_batch, args=(tasks,)).start()
+
+    def _worker_unpack_batch(self, tasks):
+        for p in tasks:
+            self._worker_unpack(p)
+            self.msg_queue.put(("P_STEP", None))
+        self.msg_queue.put(("P_STOP", None))
+        self.msg_queue.put(("REFRESH", None))
+
+    def _worker_unpack(self, p):
+        try:
+            with open(p, 'rb') as f: data = f.read()
+            fxc = fxc_parser.FxcFile(); fxc.load(data)
+            folder_name = os.path.splitext(os.path.basename(p))[0]
+            # FXC Manager hardcoded to dx11 as requested
+            out = os.path.join(self.dirs["compiled"], "dx11", folder_name)
+            g_names = ["VS", "PS", "CS", "DS", "GS", "HS"]
+            c = 0
+            for i, grp in enumerate(fxc.ShaderGroups):
+                if grp.Shaders:
+                    gd = os.path.join(out, g_names[i]); os.makedirs(gd, exist_ok=True)
+                    for sh in grp.Shaders:
+                        safe = "".join([x for x in sh.Name if x.isalnum() or x in '_-']) or f"s_{c}"
+                        with open(os.path.join(gd, safe+".cso"), 'wb') as fo: fo.write(sh.ByteCode)
+                        c+=1
+            self._log(f"Unpacked {os.path.basename(p)} -> {c} shaders.")
+        except Exception as e: self._log(f"Error unpacking {p}: {e}")
+
+    def repack_fxc(self):
+        sel = self.fxc_tree.selection()
+        tasks = [self.fxc_tree.item(i, "tags")[0] for i in sel]
+        if tasks:
+            self.msg_queue.put(("P_START", len(tasks)))
+            threading.Thread(target=self._worker_repack_batch, args=(tasks,)).start()
+
+    def _worker_repack_batch(self, tasks):
+        for p in tasks:
+            self._worker_repack(p)
+            self.msg_queue.put(("P_STEP", None))
+        self.msg_queue.put(("P_STOP", None))
+
+    def _worker_repack(self, p):
+        folder_name = os.path.splitext(os.path.basename(p))[0]
+        # FXC Manager hardcoded to dx11 as requested
+        d_dir = os.path.join(self.dirs["compiled"], "dx11", folder_name)
+        if not os.path.exists(d_dir): 
+            self._log(f"Folder not found: {folder_name}. Unpack first.")
+            return
+        try:
+            with open(p, 'rb') as f: data = f.read()
+            fxc = fxc_parser.FxcFile(); fxc.load(data)
+            g_names = ["VS", "PS", "CS", "DS", "GS", "HS"]; rep = 0
+            for i, grp in enumerate(fxc.ShaderGroups):
+                gd = os.path.join(d_dir, g_names[i])
+                if os.path.exists(gd):
+                    for sh in grp.Shaders:
+                        safe = "".join([x for x in sh.Name if x.isalnum() or x in '_-'])
+                        cp = os.path.join(gd, safe+".cso")
+                        if os.path.exists(cp):
+                            with open(cp, 'rb') as fb: bc = fb.read()
+                            if bc != sh.ByteCode: sh.ByteCode = bc; rep+=1
+            if rep > 0:
+                fxc_dir = os.path.dirname(p)
+                backup_dir = os.path.join(fxc_dir, "backups")
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, os.path.basename(p) + ".bak")
+                shutil.copy2(p, backup_path)
+                with open(p, 'wb') as f: f.write(fxc.save())
+                self._log(f"Repacked {os.path.basename(p)}: {rep} shaders updated.")
+            else: self._log(f"No changes for {os.path.basename(p)}.")
+        except Exception as e: self._log(f"Error repacking {p}: {e}")
+
+    def open_defines(self):
+        DefineManagerWindow(self.root, self._get_current_dir("source"), self.refresh_source)
+
+    def _load_hashes(self):
+        if os.path.exists(self.hash_txt):
+            with open(self.hash_txt, 'r') as f: c = f.read()
+            for b in c.split('----------------------------------------'):
+                m = re.search(r'hash\s*=\s*([^;]+);', b)
+                if m and 'found in:' in b:
+                    self.hash_map[m.group(1).strip()] = [x.strip() for x in re.split(r'[,\n]', b.split('found in:')[1]) if x.strip()]
+
+    def view_asm_selected(self):
+        sel = self.cmp_tree.selection()
+        if not sel: return
+        
+        path = self.cmp_tree.item(sel[0], "tags")[0]
+        if not path or not path.endswith(".cso"): return
+
+        threading.Thread(target=self._run_asm_dump, args=(path,), daemon=True).start()
+
+    def _run_asm_dump(self, path):
+        self._log(f"Disassembling {os.path.basename(path)}...")
+        try:
+            cmd = []
+            if self.dx_version.get() == "dx12":
+                 # Try using dxc for disassembly. DXC usually supports -dumpbin on compiled shaders? 
+                 # Or spirv-dis equivalent? 
+                 # Actually `dxc.exe -dumpbin <file>` works for signed containers sometimes, or `dxc -P <file>`?
+                 # Microsoft's `dxc.exe` is primarily a compiler. To disassemble a DXIL container we often need `dxil-dis` or `dxc -dumpbin`.
+                 # Let's try `dxc -dumpbin`. If it fails, we fall back to generic "Not Supported" message.
+                 cmd = [self.tools["dxc"], '-dumpbin', path]
+            else:
+                 # fxc.exe /nologo /dumpbin <path>
+                 cmd = [self.tools["fxc"], '/nologo', '/dumpbin', path]
+
+            res = subprocess.run(cmd, capture_output=True, text=True, errors='ignore')
+            
+            if res.returncode == 0:
+                self.root.after(0, lambda: AsmWindow(self.root, os.path.basename(path), res.stdout))
+                self._log("ASM view opened.")
+            else:
+                self._log(f"ASM Error: {res.stderr}")
+                if self.dx_version.get() == "dx12":
+                    self._log("Tip: Ensure 'dxc.exe' supports -dumpbin or use external tool.")
+        except Exception as e:
+            self._log(f"ASM Exception: {e}")
+
+if __name__ == "__main__":
+    try:
+        if MODERN_UI:
+            root = ttk.Window(themename="solar")
+        else:
+            root = tk.Tk()
+        
+        app = ShaderManagerApp(root)
+        root.mainloop()
+
+    except Exception as e:
+        print("\n" + "="*60)
+        print("!!! ПРОИЗОШЛА КРИТИЧЕСКАЯ ОШИБКА !!!")
+        print("="*60 + "\n")
+        traceback.print_exc()
+        print("\n" + "="*60)
+        input("Нажмите ENTER, чтобы выйти...")

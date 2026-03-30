@@ -1,0 +1,36 @@
+# Game data files
+*.fxc
+*.hlsl
+*.awc
+*.cso
+*.rpf
+
+# Working directories (user-generated)
+source/
+compiled/
+decompiled/
+fxc_files/
+awc_files/
+backup/
+streetlights/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+*.code-workspace
+.vscode/
+.idea/
+
+# Hash database (large, user-specific)
+hash.txt
+
+# Settings (user-specific)
+settings.ini
