@@ -8,6 +8,30 @@ import re
 from typing import Dict, Optional, Tuple
 from .models import AWCFile, Shader, Register, ResourceType
 
+# Byte sizes for HLSL types emitted by decomp.exe
+_HLSL_TYPE_SIZES = {
+    'float': 4, 'float2': 8, 'float3': 12, 'float4': 16,
+    'int': 4, 'int2': 8, 'int3': 12, 'int4': 16,
+    'uint': 4, 'uint2': 8, 'uint3': 12, 'uint4': 16,
+    'float4x4': 64, 'float4x3': 48, 'float3x3': 36,
+    'float3x4': 48, 'float2x4': 32, 'bool': 4,
+}
+
+def _get_awc_var_byte_range(cb):
+    """Get the total byte range [start, start+size) of an AWC CBuffer variable."""
+    elem_size = cb.byte_size
+    count = max(cb.array_size, 1)
+    if count == 1:
+        return (cb.pack_offset, cb.pack_offset + elem_size)
+    # Array elements are 16-byte aligned in cbuffers
+    stride = max(elem_size, 16)
+    total = (count - 1) * stride + elem_size
+    return (cb.pack_offset, cb.pack_offset + total)
+
+def _ranges_overlap(start_a, end_a, start_b, end_b):
+    """Check if byte ranges [start_a, end_a) and [start_b, end_b) overlap."""
+    return start_a < end_b and start_b < end_a
+
 
 def build_shader_lookup(awc: AWCFile) -> Dict[str, Shader]:
     """Build a lookup dict from shader name to shader object."""
@@ -115,6 +139,7 @@ def annotate_hlsl_file(hlsl_path: str, shader_lookup: Dict[str, Shader]) -> Tupl
             current_cbuffer_name = cb_match.group(1)
             current_cbuffer_slot = cb_match.group(2)
             current_cbuffer_space = cb_match.group(3) if cb_match.group(3) else "0"
+            decomp_ranges = []  # Track byte ranges of decomp.exe-generated variables
             new_lines.append(line)
             continue
             
@@ -129,11 +154,18 @@ def annotate_hlsl_file(hlsl_path: str, shader_lookup: Dict[str, Shader]) -> Tupl
                         sorted_offsets = sorted(missing_vars.keys())
                         for b_off in sorted_offsets:
                             cb = missing_vars[b_off]
-                            # Only inject if we haven't popped it (meaning decomp.exe didn't emit it)
+                            # Skip if this AWC var overlaps with any decomp.exe-generated variable
+                            awc_start, awc_end = _get_awc_var_byte_range(cb)
+                            overlaps = any(
+                                _ranges_overlap(awc_start, awc_end, d_start, d_end)
+                                for d_start, d_end in decomp_ranges
+                            )
+                            if overlaps:
+                                continue
                             array_str = f"[{cb.array_size}]" if cb.array_size > 1 else ""
                             c_index = b_off // 16
                             component = ['x', 'y', 'z', 'w'][(b_off % 16) // 4] if b_off % 16 > 0 else "x"
-                            new_lines.append(f"  {cb.type_name} {cb.cbuffer_name}{array_str} : packoffset(c{c_index:03d}.{component}); // [AWC Injected]")
+                            new_lines.append(f"  {cb.hlsl_type_name} {cb.cbuffer_name}{array_str} : packoffset(c{c_index:03d}.{component}); // [AWC Injected]")
                 new_lines.append(line)
                 in_cbuffer = False
                 continue
@@ -149,6 +181,8 @@ def annotate_hlsl_file(hlsl_path: str, shader_lookup: Dict[str, Shader]) -> Tupl
                 v_comp = {'x': 0, 'y': 4, 'z': 8, 'w': 12}[var_match.group(5)]
                 
                 byte_offset = (v_reg * 16) + v_comp
+                decomp_size = _HLSL_TYPE_SIZES.get(v_type.lower(), 4)
+                decomp_ranges.append((byte_offset, byte_offset + decomp_size))
                 
                 key = (current_cbuffer_slot, current_cbuffer_space)
                 if key in awc_cbs and byte_offset in awc_cbs[key]:
@@ -165,8 +199,32 @@ def annotate_hlsl_file(hlsl_path: str, shader_lookup: Dict[str, Shader]) -> Tupl
                     # Comment the existing line to show clarity
                     comment = var_match.group(6) or ""
                     clean_line = line.replace(comment, "").rstrip()
-                    new_lines.append(f"{clean_line} // AWC: {awc_var.type_name} {awc_var.cbuffer_name}{array_str}")
+                    new_lines.append(f"{clean_line} // AWC: {awc_var.hlsl_type_name} {awc_var.cbuffer_name}{array_str}")
                     continue
+                elif key in awc_cbs:
+                    # Check if this decomp var overlaps with any AWC var (sub-component match)
+                    # e.g., decomp emits 'float cb_007w : packoffset(c007.w)' which is part of
+                    # AWC's 'float4 BloomParams : packoffset(c007.x)'
+                    d_start = byte_offset
+                    d_end = byte_offset + decomp_size
+                    overlapping_keys = []
+                    for awc_offset, awc_cb in awc_cbs[key].items():
+                        awc_start, awc_end = _get_awc_var_byte_range(awc_cb)
+                        if _ranges_overlap(d_start, d_end, awc_start, awc_end):
+                            overlapping_keys.append((awc_offset, awc_cb))
+                    
+                    if overlapping_keys:
+                        # Pop all overlapping AWC vars to prevent duplicate injection
+                        awc_names = []
+                        for awc_offset, awc_cb in overlapping_keys:
+                            awc_cbs[key].pop(awc_offset, None)
+                            awc_names.append(f"{awc_cb.hlsl_type_name} {awc_cb.cbuffer_name}")
+                        
+                        comment = var_match.group(6) or ""
+                        clean_line = line.replace(comment, "").rstrip()
+                        overlap_info = ", ".join(awc_names)
+                        new_lines.append(f"{clean_line} // AWC: (part of {overlap_info})")
+                        continue
             
             new_lines.append(line)
         else:

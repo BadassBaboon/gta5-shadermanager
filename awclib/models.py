@@ -115,6 +115,30 @@ class CBufferData:
         return ValueType.get_name(self.type)
     
     @property
+    def hlsl_type_name(self) -> str:
+        """Get the HLSL-compatible type name (lowercase, e.g. float4, uint, int)."""
+        name = self.type_name
+        if name.startswith('Unknown'):
+            return 'float4'  # Safe fallback
+        return name.lower()
+    
+    @property
+    def byte_size(self) -> int:
+        """Get byte size of this variable's base type."""
+        _sizes = {
+            1: 4,    # Uint
+            5: 4,    # Int
+            8: 16,   # Uint4
+            9: 4,    # Float
+            10: 12,  # Float3
+            11: 8,   # Float2
+            12: 16,  # Float4
+            13: 48,  # Float4x3
+            14: 64,  # Float4x4
+        }
+        return _sizes.get(self.type, 16)
+    
+    @property
     def name_hash(self) -> int:
         """Get the uint32 variable name hash from bytes [6:10]."""
         import struct
