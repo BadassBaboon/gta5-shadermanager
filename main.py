@@ -824,6 +824,16 @@ class ShaderManagerApp:
         
         self.awc_group_technique_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(search_fr, text="Group by Technique ID", variable=self.awc_group_technique_var, command=self._awc_populate_tree, bootstyle="round-toggle-info").pack(side=LEFT, padx=(10, 0))
+
+        self.awc_group_family_var = tk.BooleanVar(value=False)
+        chk_fam = ttk.Checkbutton(search_fr, text="Group by Family", variable=self.awc_group_family_var, command=self._awc_populate_tree, bootstyle="round-toggle-success")
+        chk_fam.pack(side=LEFT, padx=(10, 0))
+        hint(chk_fam, "Bucket shaders by inferred family/category derived from\ntheir name (e.g. vehicle, ped, deferred, postfx, raytraced_*).")
+
+        self.awc_family_coarse_var = tk.BooleanVar(value=True)
+        chk_coarse = ttk.Checkbutton(search_fr, text="Coarse", variable=self.awc_family_coarse_var, command=self._awc_populate_tree, bootstyle="round-toggle-secondary")
+        chk_coarse.pack(side=LEFT, padx=(4, 0))
+        hint(chk_coarse, "When ON, related family tokens collapse into broad buckets\n(Vehicle*, VehicleTextured*, VehicleTransform* → vehicle).\nWhen OFF, every distinct token is its own group (~700+ groups).")
         
         cols_s = ("type", "size")
         tree_container, self.awc_tree = self._create_scrolled_tree(middle_fr, columns=cols_s, show="tree headings", bootstyle="info")
@@ -881,6 +891,61 @@ class ShaderManagerApp:
         match = re.search(r'(?:_| )([0-9a-fA-F]{6,16})(?:_| |$)', name)
         return match.group(1).lower() if match else None
 
+    _FAMILY_TYPE_STRIP_RE = re.compile(r'^(?:VS|PS|CS|HS|DS|GS)_?', re.IGNORECASE)
+    _FAMILY_TOKEN_RE = re.compile(r'^([A-Za-z][A-Za-z0-9]*)')
+    _FAMILY_HEX_RE = re.compile(r'^[0-9a-fA-F]{6,16}$')
+    # Curated coarse buckets — ordered, first match wins.
+    _FAMILY_COARSE_MAP = [
+        (re.compile(r'^Vehicle', re.I), 'vehicle'),
+        (re.compile(r'^Ped', re.I), 'ped'),
+        (re.compile(r'^Fur', re.I), 'fur'),
+        (re.compile(r'^PropFoliage', re.I), 'prop_foliage'),
+        (re.compile(r'^north', re.I), 'rage_north'),
+        (re.compile(r'^(?:point|spot)CM$|^capsule|^lightTile|^tiledLight|^directional', re.I), 'lighting'),
+        (re.compile(r'^Cascade|^Shadow|^SoftShadow|^SRFTCS', re.I), 'shadows'),
+        (re.compile(r'^MirrorReflection|^Reflection', re.I), 'reflection'),
+        (re.compile(r'^Deferred', re.I), 'deferred'),
+        (re.compile(r'^Transform', re.I), 'transform'),
+        (re.compile(r'^Textured', re.I), 'forward_textured'),
+        (re.compile(r'^Blit', re.I), 'blit'),
+        (re.compile(r'^Clear', re.I), 'clear'),
+        (re.compile(r'^Rage', re.I), 'rage_im'),
+        (re.compile(r'^Cloud', re.I), 'clouds'),
+        (re.compile(r'^Sky', re.I), 'sky'),
+        (re.compile(r'^DOF|^DepthOfField|^adaptiveDof|^dofCompute', re.I), 'depth_of_field'),
+        (re.compile(r'^Foam|^River|^Water|^puddle', re.I), 'water'),
+        (re.compile(r'^BreakableGlass|^Glass', re.I), 'glass'),
+        (re.compile(r'^Passthrough|^PassThrough', re.I), 'passthrough'),
+        (re.compile(r'^postfx', re.I), 'postfx'),
+        (re.compile(r'^bloom|^FSR|^TemporalAA|^ReactiveMask|^BiasCurrentColor', re.I), 'postfx'),
+        (re.compile(r'^ssdo|^HDAO|^MRSSAO|^screenTransformS?SAO|^screenTransformDepthSSAO', re.I), 'ambient_occlusion'),
+        (re.compile(r'^raytraced|^bvh', re.I), 'raytraced'),
+        (re.compile(r'^volumeShaft|^lightShaft', re.I), 'lightshafts'),
+        (re.compile(r'^ptx', re.I), 'particles'),
+        (re.compile(r'^Vfx', re.I), 'vfx'),
+        (re.compile(r'^texturecompression', re.I), 'texture_tools'),
+    ]
+
+    @classmethod
+    def _extract_family_group(cls, name, coarse=True):
+        """Derive a family/category bucket from a shader name.
+        Returns (group_key, is_namespaced). is_namespaced=True for explicit `group:Name` shaders.
+        """
+        if ':' in name:
+            return name.split(':', 1)[0], True
+        rest = cls._FAMILY_TYPE_STRIP_RE.sub('', name, count=1)
+        m = cls._FAMILY_TOKEN_RE.match(rest)
+        if not m:
+            return '_untitled', False
+        tok = m.group(1)
+        if cls._FAMILY_HEX_RE.fullmatch(tok):
+            return '_untitled', False
+        if coarse:
+            for pat, bucket in cls._FAMILY_COARSE_MAP:
+                if pat.match(tok):
+                    return bucket, False
+        return tok, False
+
     def _awc_populate_tree(self):
         self.awc_tree.delete(*self.awc_tree.get_children())
         if not self.awc_file: return
@@ -890,7 +955,9 @@ class ShaderManagerApp:
             search_term = self.awc_search_var.get().lower()
         
         group_by_technique = hasattr(self, 'awc_group_technique_var') and self.awc_group_technique_var.get()
-        
+        group_by_family = hasattr(self, 'awc_group_family_var') and self.awc_group_family_var.get()
+        family_coarse = not hasattr(self, 'awc_family_coarse_var') or self.awc_family_coarse_var.get()
+
         categories = [
             ("Vertex Shaders", self.awc_file.vertex_shaders, "VS"),
             ("Pixel Shaders", self.awc_file.pixel_shaders, "PS"),
@@ -899,10 +966,44 @@ class ShaderManagerApp:
             ("Hull Shaders", self.awc_file.hull_shaders, "HS"),
             ("Domain Shaders", self.awc_file.domain_shaders, "DS")
         ]
-        
+
         self.awc_shader_map = {}
-        
-        if group_by_technique:
+
+        if group_by_family:
+            all_shaders = []
+            for cat_name, shaders, sh_type in categories:
+                for s in shaders:
+                    if search_term in s.name.lower() or search_term in f"0x{s.hash:016x}":
+                        all_shaders.append((s, sh_type))
+
+            from collections import defaultdict
+            family_groups = defaultdict(list)
+            namespaced = set()
+            for s, sh_type in all_shaders:
+                key, is_ns = self._extract_family_group(s.name, coarse=family_coarse)
+                family_groups[key].append((s, sh_type))
+                if is_ns:
+                    namespaced.add(key)
+
+            # Sort: explicit namespaces first (alpha), then by descending count, _untitled last
+            def sort_key(kv):
+                k, v = kv
+                if k == '_untitled':
+                    return (3, 0, k)
+                if k in namespaced:
+                    return (0, k.lower(), 0)
+                return (1, -len(v), k.lower())
+
+            for key, group in sorted(family_groups.items(), key=sort_key):
+                types_in_group = sorted(set(t for _, t in group))
+                type_summary = "/".join(types_in_group)
+                icon = "📛" if key in namespaced else ("❓" if key == '_untitled' else "📦")
+                label = "Untitled / Hash-only" if key == '_untitled' else key
+                group_id = self.awc_tree.insert("", "end", text=f"{icon} {label} ({len(group)})", values=(type_summary, ""), open=False)
+                for s, sh_type in sorted(group, key=lambda x: x[0].name.lower()):
+                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    self.awc_shader_map[item_id] = s
+        elif group_by_technique:
             # Collect all shaders with their types, filtered by search
             all_shaders = []
             for cat_name, shaders, sh_type in categories:

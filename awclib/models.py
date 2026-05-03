@@ -11,12 +11,18 @@ from typing import List, Optional
 
 class ValueType(IntEnum):
     """Shader value types as defined in the template."""
+    Bool = 0
     Uint = 1
+    Uint2 = 2
+    Uint3 = 3
+    Uint4 = 4
     Int = 5
-    Uint4 = 8
+    Int2 = 6
+    Int3 = 7
+    Int4 = 8
     Float = 9
-    Float3 = 10
-    Float2 = 11
+    Float2 = 10
+    Float3 = 11
     Float4 = 12
     Float4x3 = 13
     Float4x4 = 14
@@ -33,8 +39,15 @@ class ValueType(IntEnum):
     def from_string(cls, name: str) -> int:
         """Get type value from string name map."""
         mapping = {
+            'bool': cls.Bool,
             'uint': cls.Uint,
+            'uint2': cls.Uint2,
+            'uint3': cls.Uint3,
+            'uint4': cls.Uint4,
             'int': cls.Int,
+            'int2': cls.Int2,
+            'int3': cls.Int3,
+            'int4': cls.Int4,
             'float': cls.Float,
             'float2': cls.Float2,
             'float3': cls.Float3,
@@ -126,12 +139,18 @@ class CBufferData:
     def byte_size(self) -> int:
         """Get byte size of this variable's base type."""
         _sizes = {
+            0: 4,    # Bool
             1: 4,    # Uint
+            2: 8,    # Uint2
+            3: 12,   # Uint3
+            4: 16,   # Uint4
             5: 4,    # Int
-            8: 16,   # Uint4
+            6: 8,    # Int2
+            7: 12,   # Int3
+            8: 16,   # Int4
             9: 4,    # Float
-            10: 12,  # Float3
-            11: 8,   # Float2
+            10: 8,   # Float2
+            11: 12,  # Float3
             12: 16,  # Float4
             13: 48,  # Float4x3
             14: 64,  # Float4x4
