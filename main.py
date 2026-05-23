@@ -217,7 +217,7 @@ class ShaderManagerApp:
         hint(self.btn_fxc, "Unpack and repack DX11 .fxc shader archives\nused by the game engine.")
         
         self.btn_awc = ttk.Button(sidebar, text="📦  AWC Archives", style="Sidebar.TButton", command=lambda: self._show_page("awc"))
-        hint(self.btn_awc, "Browse and modify DX12 .awc shader libraries.\nImport/export individual shader binaries.")
+        hint(self.btn_awc, "Unpack and repack DX12 .awc (FXDB / SGD2) shader libraries.\nBrowse effects, techniques and passes; import/export individual\nshaders or batch-extract everything by effect group.")
         # Do not pack awc button initially; handled by _on_dx_change
         
         ttk.Frame(sidebar, height=2, bootstyle="secondary").pack(fill=X, pady=20, padx=20) 
@@ -759,7 +759,7 @@ class ShaderManagerApp:
         banner = ttk.Frame(page, padding=10, bootstyle="danger")
         banner.pack(fill=X, pady=(0, 10))
         ttk.Label(banner, text="📦  GTA 5 Enhanced — DX12 Archives", font=("Segoe UI", 10, "bold"), bootstyle="inverse-danger").pack(side=LEFT, padx=(0, 10))
-        ttk.Label(banner, text="This tab is for GTA 5 Enhanced (new version). Open an .awc shader library, select a shader, export it, decompile and edit, recompile, then import it back and save. Use 'Compile & Decompile' (DX12 mode) for the editing step.", wraplength=900, bootstyle="inverse-danger").pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(banner, text="This tab is for GTA 5 Enhanced (new version). Workflow: 1) Select an .awc on the left and click 📦 Unpack to extract every shader into /compiled/dx12/<archive>/<effect>/<stage>/. 2) Decompile, edit, recompile via the 'Compile & Decompile' tab (DX12 mode). 3) Click 📤 Repack to inject changes back into the .awc — only modified shaders are touched, a .bak is created automatically.", wraplength=900, bootstyle="inverse-danger").pack(side=LEFT, fill=X, expand=True)
         
 
         tools = ttk.Frame(page)

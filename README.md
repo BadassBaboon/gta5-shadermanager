@@ -26,14 +26,16 @@ Supports both **GTA 5 Legacy (DX11)** and **GTA 5 Enhanced (DX12)**.
 - Import/Export individual shader bytecode
 - View shader metadata: variables, constant buffers, version info
 
-### 📦 AWC Archives (DX12)
-- Parse and browse `.awc` (SGD2) shader library files
+### 📦 AWC Archives (DX12 / FXDB)
+- Parse and browse `.awc` (FXDB / SGD2 — Shader Group Data v2) shader libraries
 - Full register binding metadata: CBVs, textures, samplers, UAVs
 - CBuffer layout inspection with variable names and types
+- Effect tree view: shaders grouped by their owning effect, with techniques and passes
+- **📦 Unpack / 📤 Repack** batch flow into `/compiled/dx12/<archive>/<effect>/<stage>/` (mirrors the FXC workflow; only changed shaders are injected on repack, with automatic `.bak`)
 - Import/Export individual shader bytecode
 - Decompile directly from AWC with metadata restoration
-- Rebuild modified AWC files
-- Group shaders by Technique ID
+- Rebuild modified AWC files (byte-identical round-trip when nothing is mutated)
+- Group shaders by Effect or by Family heuristic
 
 ### 📖 Built-in Documentation
 - Step-by-step modding guides for DX11 and DX12 workflows
@@ -103,14 +105,19 @@ The tool auto-creates these directories:
 6. **Repack** — FXC Archives tab → Click **📤 Repack** (auto-injects changed shaders)
 7. **Install** — Replace `.fxc` in game archives via OpenIV/CodeWalker
 
-## DX12 Modding Workflow
+## DX12 Modding Workflow (AWC / FXDB)
 
-1. Switch to **DX12** mode in the toolbar
-2. **Open** — AWC Archives tab → Load `.awc` file
-3. **Export & Decompile** — Select shader → **📤 Export CSO** or **▼ Decompile to HLSL**
-4. **Edit & Compile** — Edit `.hlsl`, compile via Compile & Decompile tab (DX12 mode)
-5. **Import** — AWC Archives tab → Select shader → **📥 Import CSO**
-6. **Save** — Click **💾 Save .awc As...**
+1. **Extract** — Use CodeWalker (Enhanced support required) to get `sga_*.awc` files from `update/update.rpf → common/shaders/win32_60_final/`
+2. **Switch** — Toggle the tool to **DX12** mode in the toolbar
+3. **Unpack** — AWC Archives tab → Select `.awc`(s) → Click **📦 Unpack**
+   - Output: `/compiled/dx12/<archive>.awc/<effect>/<stage>/<shader_name>.cso`
+4. **Decompile** — Compile & Decompile tab → Select `.cso` → Click **▼ Decompile to HLSL**
+5. **Edit** — Move `.hlsl` to `/source/dx12/`, edit in your text editor
+6. **Compile** — Select `.hlsl` → Click **▶ Compile Selected** (auto-routes the `.cso` back into the matching effect folder)
+7. **Repack** — AWC Archives tab → Click **📤 Repack** (only changed shaders are injected; `.bak` is created in `/awc_files/backups/`)
+8. **Install** — Replace `.awc` in `update.rpf` via CodeWalker (Edit Mode required)
+
+For single-shader edits, you can skip Unpack/Repack and use **📥 Import CSO** / **💾 Save .awc As...** on the loaded library instead.
 
 ---
 
