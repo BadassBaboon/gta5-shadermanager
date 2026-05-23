@@ -768,6 +768,12 @@ class ShaderManagerApp:
         btn_awc_open = ttk.Button(tools, text="📂 Open .awc File", command=self._awc_open, bootstyle="info")
         btn_awc_open.pack(side=LEFT, padx=(0, 5))
         hint(btn_awc_open, "Open an .awc shader library from disk.\nFiles in /awc_files/ are listed on the left.")
+        btn_awc_unpack = ttk.Button(tools, text="📦 Unpack", command=self.unpack_awc, bootstyle="info")
+        btn_awc_unpack.pack(side=LEFT, padx=(0, 5))
+        hint(btn_awc_unpack, "Extract all shaders from the selected .awc archive(s)\ninto /compiled/dx12/<archive>/<group>/<type>/ as .cso files.\nShared shaders are placed under their first owning effect.")
+        btn_awc_repack = ttk.Button(tools, text="📤 Repack", command=self.repack_awc, bootstyle="warning")
+        btn_awc_repack.pack(side=LEFT, padx=(0, 15))
+        hint(btn_awc_repack, "Inject modified .cso files back into the selected\n.awc archive(s). Only changed shaders are updated.\nA backup is created automatically in /awc_files/backups/.")
         btn_awc_save = ttk.Button(tools, text="💾 Save .awc As...", command=self._awc_save, bootstyle="success")
         btn_awc_save.pack(side=LEFT, padx=(0, 15))
         hint(btn_awc_save, "Rebuild and save the loaded AWC file.\nUse after importing modified shader bytecode.")
@@ -822,8 +828,10 @@ class ShaderManagerApp:
         self.awc_search_var.trace_add("write", lambda *args: self._awc_populate_tree())
         ttk.Entry(search_fr, textvariable=self.awc_search_var).pack(side=LEFT, fill=X, expand=True)
         
-        self.awc_group_technique_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(search_fr, text="Group by Technique ID", variable=self.awc_group_technique_var, command=self._awc_populate_tree, bootstyle="round-toggle-info").pack(side=LEFT, padx=(10, 0))
+        self.awc_group_effect_var = tk.BooleanVar(value=False)
+        chk_eff = ttk.Checkbutton(search_fr, text="Group by Effect", variable=self.awc_group_effect_var, command=self._awc_populate_tree, bootstyle="round-toggle-warning")
+        chk_eff.pack(side=LEFT, padx=(10, 0))
+        hint(chk_eff, "Group shaders by the real effect they belong to,\nas decoded from the .awc trailer (e.g. 'postfx_lut',\n'deferred_lighting', 'scaleform_shaders'). A shader\nshared by multiple effects appears under each.")
 
         self.awc_group_family_var = tk.BooleanVar(value=False)
         chk_fam = ttk.Checkbutton(search_fr, text="Group by Family", variable=self.awc_group_family_var, command=self._awc_populate_tree, bootstyle="round-toggle-success")
@@ -884,12 +892,30 @@ class ShaderManagerApp:
             messagebox.showerror("Error", f"Failed to parse AWC:\n{e}")
             self._log(f"AWC Parse Error: {e}")
 
-    @staticmethod
-    def _extract_technique_id(name):
-        """Extract hex technique ID from shader name (e.g. '7903a05e' from 'VS_Transform_7903a05e_Wrapped')."""
-        import re
-        match = re.search(r'(?:_| )([0-9a-fA-F]{6,16})(?:_| |$)', name)
-        return match.group(1).lower() if match else None
+    def _find_owning_effects(self, shader):
+        """Return effect names that reference the given shader via the trailer index lists."""
+        if not self.awc_file or not getattr(self.awc_file, 'effects', None):
+            return []
+        stage_arrays = [
+            (self.awc_file.vertex_shaders,   "vs_indices"),
+            (self.awc_file.pixel_shaders,    "ps_indices"),
+            (self.awc_file.geometry_shaders, "gs_indices"),
+            (self.awc_file.domain_shaders,   "ds_indices"),
+            (self.awc_file.hull_shaders,     "hs_indices"),
+            (self.awc_file.compute_shaders,  "cs_indices"),
+        ]
+        gi = None
+        attr = None
+        for stage_list, a in stage_arrays:
+            for i, s in enumerate(stage_list):
+                if s is shader:
+                    gi = i
+                    attr = a
+                    break
+            if gi is not None: break
+        if gi is None:
+            return []
+        return [e.name for e in self.awc_file.effects if gi in getattr(e, attr, [])]
 
     _FAMILY_TYPE_STRIP_RE = re.compile(r'^(?:VS|PS|CS|HS|DS|GS)_?', re.IGNORECASE)
     _FAMILY_TOKEN_RE = re.compile(r'^([A-Za-z][A-Za-z0-9]*)')
@@ -954,7 +980,7 @@ class ShaderManagerApp:
         if hasattr(self, 'awc_search_var'):
             search_term = self.awc_search_var.get().lower()
         
-        group_by_technique = hasattr(self, 'awc_group_technique_var') and self.awc_group_technique_var.get()
+        group_by_effect = hasattr(self, 'awc_group_effect_var') and self.awc_group_effect_var.get()
         group_by_family = hasattr(self, 'awc_group_family_var') and self.awc_group_family_var.get()
         family_coarse = not hasattr(self, 'awc_family_coarse_var') or self.awc_family_coarse_var.get()
 
@@ -969,7 +995,58 @@ class ShaderManagerApp:
 
         self.awc_shader_map = {}
 
-        if group_by_family:
+        if group_by_effect and getattr(self.awc_file, 'effects', None):
+            # Build (stage_array, type_label) tuples ordered to match Effect index lists.
+            stage_arrays = [
+                (self.awc_file.vertex_shaders, "VS", "vs_indices"),
+                (self.awc_file.pixel_shaders,  "PS", "ps_indices"),
+                (self.awc_file.geometry_shaders, "GS", "gs_indices"),
+                (self.awc_file.domain_shaders, "DS", "ds_indices"),
+                (self.awc_file.hull_shaders,   "HS", "hs_indices"),
+                (self.awc_file.compute_shaders,"CS", "cs_indices"),
+            ]
+            referenced_globals = set()
+            for eff in self.awc_file.effects:
+                members = []
+                for stage_list, sh_type, attr in stage_arrays:
+                    for gi in getattr(eff, attr, []):
+                        if 0 <= gi < len(stage_list):
+                            s = stage_list[gi]
+                            if search_term and search_term not in s.name.lower() and search_term not in f"0x{s.hash:016x}":
+                                continue
+                            members.append((s, sh_type, gi, attr))
+                            referenced_globals.add((attr, gi))
+                if not members:
+                    continue
+                types_in_group = sorted({t for _, t, _, _ in members})
+                type_summary = "/".join(types_in_group)
+                techs = getattr(eff, 'techniques', None) or []
+                tech_count = len(techs)
+                pass_count = sum(len(getattr(t, 'passes', [])) for t in techs)
+                label = f"📦 {eff.name} ({len(members)} shaders"
+                if tech_count:
+                    label += f", {tech_count} techs, {pass_count} passes"
+                label += ")"
+                group_id = self.awc_tree.insert("", "end", text=label, values=(type_summary, ""), open=False)
+                for s, sh_type, gi, _ in sorted(members, key=lambda x: (x[1], x[0].name.lower())):
+                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    self.awc_shader_map[item_id] = s
+
+            # Orphans: any shader not referenced by any effect.
+            orphans = []
+            for stage_list, sh_type, attr in stage_arrays:
+                for gi, s in enumerate(stage_list):
+                    if (attr, gi) in referenced_globals:
+                        continue
+                    if search_term and search_term not in s.name.lower() and search_term not in f"0x{s.hash:016x}":
+                        continue
+                    orphans.append((s, sh_type))
+            if orphans:
+                orphan_id = self.awc_tree.insert("", "end", text=f"❓ Unreferenced ({len(orphans)})", values=("", ""), open=False)
+                for s, sh_type in sorted(orphans, key=lambda x: (x[1], x[0].name.lower())):
+                    item_id = self.awc_tree.insert(orphan_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    self.awc_shader_map[item_id] = s
+        elif group_by_family:
             all_shaders = []
             for cat_name, shaders, sh_type in categories:
                 for s in shaders:
@@ -1002,42 +1079,6 @@ class ShaderManagerApp:
                 group_id = self.awc_tree.insert("", "end", text=f"{icon} {label} ({len(group)})", values=(type_summary, ""), open=False)
                 for s, sh_type in sorted(group, key=lambda x: x[0].name.lower()):
                     item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
-                    self.awc_shader_map[item_id] = s
-        elif group_by_technique:
-            # Collect all shaders with their types, filtered by search
-            all_shaders = []
-            for cat_name, shaders, sh_type in categories:
-                for s in shaders:
-                    if search_term in s.name.lower() or search_term in f"0x{s.hash:016x}":
-                        all_shaders.append((s, sh_type))
-            
-            # Group by technique ID
-            from collections import OrderedDict
-            technique_groups = OrderedDict()
-            ungrouped = []
-            for s, sh_type in all_shaders:
-                tech_id = self._extract_technique_id(s.name)
-                if tech_id:
-                    if tech_id not in technique_groups:
-                        technique_groups[tech_id] = []
-                    technique_groups[tech_id].append((s, sh_type))
-                else:
-                    ungrouped.append((s, sh_type))
-            
-            # Insert grouped shaders
-            for tech_id, group in technique_groups.items():
-                types_in_group = set(t for _, t in group)
-                type_summary = "/".join(sorted(types_in_group))
-                group_id = self.awc_tree.insert("", "end", text=f"🔗 Technique {tech_id} ({len(group)} shaders)", values=(type_summary, ""), open=True)
-                for s, sh_type in group:
-                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
-                    self.awc_shader_map[item_id] = s
-            
-            # Insert ungrouped shaders
-            if ungrouped:
-                misc_id = self.awc_tree.insert("", "end", text=f"Ungrouped ({len(ungrouped)})", values=("", ""), open=True)
-                for s, sh_type in ungrouped:
-                    item_id = self.awc_tree.insert(misc_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
                     self.awc_shader_map[item_id] = s
         else:
             # Default: group by shader type category
@@ -1075,6 +1116,10 @@ class ShaderManagerApp:
             cbv_count = sum(1 for r in shader.registers if ResourceType.get_register_prefix(r.resource_type) == "b")
             uav_count = sum(1 for r in shader.registers if ResourceType.get_register_prefix(r.resource_type) == "u")
             details += f"Registers: {shader.reg_count} | CBVs: {cbv_count} | Textures: {tex_count} | Samplers: {sampler_count} | UAVs: {uav_count}\n"
+
+            owning_effects = self._find_owning_effects(shader)
+            if owning_effects:
+                details += f"Effects: {', '.join(owning_effects)}\n"
             details += "="*40 + "\n"
             
             for reg in shader.registers:
@@ -1925,6 +1970,141 @@ class ShaderManagerApp:
                 self._log(f"Repacked {os.path.basename(p)}: {rep} shaders updated.")
             else: self._log(f"No changes for {os.path.basename(p)}.")
         except Exception as e: self._log(f"Error repacking {p}: {e}")
+
+    # ---------- AWC: Unpack / Repack (effect-grouped layout) ----------
+
+    @staticmethod
+    def _awc_safe_name(s):
+        # Strip path-illegal chars. Notably exclude ':' — Windows treats it as
+        # the NTFS alternate-data-stream separator, which silently hides shader
+        # bytes (e.g. "postfx_lut:CS_…" becomes ADS on a file named "postfx_lut").
+        return "".join(c for c in s if c.isalnum() or c in "_-.") or "unnamed"
+
+    def _awc_build_owner_map(self, awc):
+        """Return dict[(stage_key, global_idx)] -> effect_name (first owner wins)."""
+        owners = {}
+        stage_attrs = [
+            ('vertex',   'vs_indices'), ('pixel',    'ps_indices'),
+            ('geometry', 'gs_indices'), ('domain',   'ds_indices'),
+            ('hull',     'hs_indices'), ('compute',  'cs_indices'),
+        ]
+        for eff in (getattr(awc, 'effects', None) or []):
+            for stage_key, attr in stage_attrs:
+                for gi in getattr(eff, attr, []) or []:
+                    if (stage_key, gi) not in owners:
+                        owners[(stage_key, gi)] = self._awc_safe_name(eff.name or 'unnamed')
+        return owners
+
+    def _awc_paths_for_shader(self, base_dir, archive_filename, stage_key, stage_label, gi, shader_name, owners):
+        """Compute the unpacked .cso filesystem path for one shader."""
+        effect_folder = owners.get((stage_key, gi), '_unassigned')
+        safe = self._awc_safe_name(shader_name) or f'{stage_label}_{gi}'
+        folder = os.path.join(base_dir, archive_filename, effect_folder, stage_label)
+        return folder, safe + '.cso'
+
+    def unpack_awc(self):
+        sel = self.awc_file_tree.selection()
+        tasks = [self.awc_file_tree.item(i, "tags")[0] for i in sel]
+        if tasks:
+            self.msg_queue.put(("P_START", len(tasks)))
+            threading.Thread(target=self._worker_awc_unpack_batch, args=(tasks,)).start()
+
+    def _worker_awc_unpack_batch(self, tasks):
+        for p in tasks:
+            self._worker_awc_unpack(p)
+            self.msg_queue.put(("P_STEP", None))
+        self.msg_queue.put(("P_STOP", None))
+        self.msg_queue.put(("REFRESH", None))
+
+    def _worker_awc_unpack(self, p):
+        try:
+            from awclib.parser import parse_awc_file
+            awc = parse_awc_file(p)
+            archive_filename = os.path.basename(p)
+            out_base = os.path.join(self.dirs["compiled"], "dx12")
+            owners = self._awc_build_owner_map(awc)
+            count = 0
+            stage_arrs = [
+                ('vertex',   'VS', awc.vertex_shaders),
+                ('pixel',    'PS', awc.pixel_shaders),
+                ('geometry', 'GS', awc.geometry_shaders),
+                ('domain',   'DS', awc.domain_shaders),
+                ('hull',     'HS', awc.hull_shaders),
+                ('compute',  'CS', awc.compute_shaders),
+            ]
+            for stage_key, stage_label, arr in stage_arrs:
+                for gi, sh in enumerate(arr or []):
+                    folder, fname = self._awc_paths_for_shader(
+                        out_base, archive_filename, stage_key, stage_label, gi, sh.name, owners
+                    )
+                    os.makedirs(folder, exist_ok=True)
+                    with open(os.path.join(folder, fname), 'wb') as fo:
+                        fo.write(sh.shader_binary)
+                    count += 1
+            self._log(f"Unpacked {archive_filename} -> {count} shaders into {os.path.relpath(os.path.join(out_base, archive_filename), self.base_dir)}.")
+        except Exception as e:
+            self._log(f"Error unpacking {p}: {e}")
+
+    def repack_awc(self):
+        sel = self.awc_file_tree.selection()
+        tasks = [self.awc_file_tree.item(i, "tags")[0] for i in sel]
+        if tasks:
+            self.msg_queue.put(("P_START", len(tasks)))
+            threading.Thread(target=self._worker_awc_repack_batch, args=(tasks,)).start()
+
+    def _worker_awc_repack_batch(self, tasks):
+        for p in tasks:
+            self._worker_awc_repack(p)
+            self.msg_queue.put(("P_STEP", None))
+        self.msg_queue.put(("P_STOP", None))
+
+    def _worker_awc_repack(self, p):
+        try:
+            from awclib.parser import parse_awc_file
+            from awclib.awc_writer import rebuild_awc
+            archive_filename = os.path.basename(p)
+            d_dir = os.path.join(self.dirs["compiled"], "dx12", archive_filename)
+            if not os.path.isdir(d_dir):
+                self._log(f"Folder not found: {os.path.relpath(d_dir, self.base_dir)}. Unpack first.")
+                return
+            awc = parse_awc_file(p)
+            owners = self._awc_build_owner_map(awc)
+            replaced = 0
+            stage_arrs = [
+                ('vertex',   'VS', awc.vertex_shaders),
+                ('pixel',    'PS', awc.pixel_shaders),
+                ('geometry', 'GS', awc.geometry_shaders),
+                ('domain',   'DS', awc.domain_shaders),
+                ('hull',     'HS', awc.hull_shaders),
+                ('compute',  'CS', awc.compute_shaders),
+            ]
+            for stage_key, stage_label, arr in stage_arrs:
+                for gi, sh in enumerate(arr or []):
+                    folder, fname = self._awc_paths_for_shader(
+                        os.path.join(self.dirs["compiled"], "dx12"),
+                        archive_filename, stage_key, stage_label, gi, sh.name, owners
+                    )
+                    fp = os.path.join(folder, fname)
+                    if not os.path.exists(fp):
+                        continue
+                    with open(fp, 'rb') as fb:
+                        bc = fb.read()
+                    if bc != sh.shader_binary:
+                        sh.shader_binary = bc
+                        sh.size = len(bc)
+                        replaced += 1
+            if replaced > 0:
+                awc_dir = os.path.dirname(p)
+                backup_dir = os.path.join(awc_dir, "backups")
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, archive_filename + ".bak")
+                shutil.copy2(p, backup_path)
+                rebuild_awc(awc, p, p)
+                self._log(f"Repacked {archive_filename}: {replaced} shaders updated (backup at {os.path.relpath(backup_path, self.base_dir)}).")
+            else:
+                self._log(f"No changes for {archive_filename}.")
+        except Exception as e:
+            self._log(f"Error repacking {p}: {e}")
 
     def open_defines(self):
         DefineManagerWindow(self.root, self._get_current_dir("source"), self.refresh_source)
