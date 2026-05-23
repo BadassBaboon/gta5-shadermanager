@@ -1,78 +1,150 @@
 @echo off
-title GTA 5 Shader Manager Build
+setlocal enabledelayedexpansion
+title GTA 5 Shader Manager - Build Script
 color 0A
 
-echo ========================================================
-echo                PREPARING BUILD
-echo ========================================================
+REM ========================================================
+REM  Configuration
+REM ========================================================
+set "APP_NAME=GTA5ShaderManager"
+set "MAIN_SCRIPT=main.py"
+set "REQUIRED_PACKAGES=pyinstaller ttkbootstrap configparser"
 
-REM Check if Python is installed
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python is not installed or not added to PATH.
+echo ========================================================
+echo            GTA 5 SHADER MANAGER - BUILD
+echo ========================================================
+echo.
+
+REM ========================================================
+REM  [0/4] Verify main script exists
+REM ========================================================
+if not exist "%MAIN_SCRIPT%" (
+    color 0C
+    echo [ERROR] %MAIN_SCRIPT% not found in current directory.
+    echo Place build.bat next to %MAIN_SCRIPT% and try again.
+    echo.
     pause
-    exit /b
+    exit /b 1
 )
 
-REM Install required libraries
-echo [1/4] Installing/Updating libraries...
-pip install --upgrade pyinstaller ttkbootstrap configparser
+REM ========================================================
+REM  [1/4] Check Python
+REM ========================================================
+echo [1/4] Checking Python...
 
+set "PYTHON_CMD="
+
+REM Try the py launcher first
+py -3 --version >nul 2>&1
+if !errorlevel! equ 0 set "PYTHON_CMD=py -3"
+
+REM Fall back to plain "python"
+if not defined PYTHON_CMD (
+    python --version >nul 2>&1
+    if !errorlevel! equ 0 set "PYTHON_CMD=python"
+)
+
+if not defined PYTHON_CMD (
+    color 0C
+    echo.
+    echo [ERROR] Python is not installed or not on PATH.
+    echo.
+    echo Please install Python 3.10 or newer from:
+    echo     https://www.python.org/downloads/
+    echo.
+    echo IMPORTANT: During installation, check the box
+    echo "Add Python to PATH" on the first screen.
+    echo.
+    pause
+    exit /b 1
+)
+
+for /f "tokens=*" %%V in ('!PYTHON_CMD! --version 2^>^&1') do echo      Using: %%V  ^(!PYTHON_CMD!^)
+
+REM ========================================================
+REM  [2/4] Install required packages
+REM ========================================================
 echo.
-echo ========================================================
-echo                CLEANING OLD FILES
-echo ========================================================
-echo [2/4] Removing build and dist folders...
+echo [2/4] Installing/updating build dependencies...
+!PYTHON_CMD! -m pip install --upgrade pip --quiet --disable-pip-version-check
+!PYTHON_CMD! -m pip install --upgrade --disable-pip-version-check %REQUIRED_PACKAGES%
+if !errorlevel! neq 0 (
+    color 0C
+    echo [ERROR] Failed to install required packages.
+    echo Check your internet connection and try again.
+    pause
+    exit /b 1
+)
+
+REM ========================================================
+REM  [3/4] Clean previous build artifacts
+REM ========================================================
+echo.
+echo [3/4] Cleaning old build artifacts...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
 if exist "*.spec" del /q "*.spec"
 
+REM ========================================================
+REM  [4/4] Run PyInstaller
+REM ========================================================
 echo.
-echo ========================================================
-echo                COMPILING TO .EXE
-echo ========================================================
-echo [3/4] Running PyInstaller...
+echo [4/4] Compiling %MAIN_SCRIPT% to %APP_NAME%.exe...
+echo.
 
-REM --noconsole: hides the black console window
-REM --onefile: compiles everything into a single .exe file
-REM --name: output file name
-REM --hidden-import: ensures ttkbootstrap is included
+set "PYI_ARGS=--noconsole --onefile --clean --name %APP_NAME% --hidden-import=ttkbootstrap"
+if exist "icon.ico" set "PYI_ARGS=!PYI_ARGS! --icon=icon.ico"
 
-pyinstaller --noconsole --onefile --clean --name "GTA5ShaderManager" --hidden-import=ttkbootstrap main.py
-
-if %errorlevel% neq 0 (
+!PYTHON_CMD! -m PyInstaller !PYI_ARGS! "%MAIN_SCRIPT%"
+if !errorlevel! neq 0 (
     color 0C
     echo.
-    echo [CRITICAL ERROR] Build failed!
+    echo [CRITICAL ERROR] PyInstaller build failed.
     pause
-    exit /b
+    exit /b 1
 )
 
+REM ========================================================
+REM  Copy resources next to the .exe
+REM ========================================================
 echo.
 echo ========================================================
 echo                COPYING RESOURCES
 echo ========================================================
-echo [4/4] Creating folder structure and copying files...
 
-REM Switch to dist folder
-cd dist
+pushd dist >nul
 
-REM Copy hash.txt (Required)
-if exist "..\hash.txt" copy "..\hash.txt" .
+if exist "..\hash.txt" (
+    copy /y "..\hash.txt" . >nul
+    echo      Copied: hash.txt
+)
 
-REM Copy compilers folder (fxc.exe etc.)
-if exist "..\dxcompilers" xcopy "..\dxcompilers" "dxcompilers\" /E /I /Y
+if exist "..\dxcompilers" (
+    xcopy "..\dxcompilers" "dxcompilers\" /E /I /Y >nul
+    echo      Copied: dxcompilers\
+)
 
-REM Create empty working directories so the app starts smoothly
-if not exist "source" mkdir "source"
-if not exist "compiled" mkdir "compiled"
-if not exist "decompiled" mkdir "decompiled"
-if not exist "fxc_files" mkdir "fxc_files"
+for %%D in (source compiled decompiled fxc_files) do (
+    if not exist "%%D" (
+        mkdir "%%D"
+        echo      Created: %%D\
+    )
+)
 
+popd >nul
+
+REM ========================================================
+REM  Done
+REM ========================================================
 echo.
 echo ========================================================
-echo                     DONE!
+echo                       DONE!
 echo ========================================================
-echo Your program is located in the folder: dist
+echo Output: %CD%\dist\%APP_NAME%.exe
 echo.
-pause
+
+choice /C YN /M "Open dist folder now"
+if !errorlevel! equ 1 start "" "dist"
+
+endlocal
+exit /b 0
