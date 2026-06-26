@@ -219,8 +219,12 @@ class ShaderManagerApp:
         self.btn_awc = ttk.Button(sidebar, text="📦  AWC Archives", style="Sidebar.TButton", command=lambda: self._show_page("awc"))
         hint(self.btn_awc, "Unpack and repack DX12 .awc (FXDB / SGD2) shader libraries.\nBrowse effects, techniques and passes; import/export individual\nshaders or batch-extract everything by effect group.")
         # Do not pack awc button initially; handled by _on_dx_change
-        
-        ttk.Frame(sidebar, height=2, bootstyle="secondary").pack(fill=X, pady=20, padx=20) 
+
+        self.btn_renodx = ttk.Button(sidebar, text="🔄  RenoDX Sync", style="Sidebar.TButton", command=lambda: self._show_page("renodx"))
+        self.btn_renodx.pack(fill=X, pady=2)
+        hint(self.btn_renodx, "Bridge between RenoDX live shaders and the .awc library.\nExport the effect map (shader_effects.json) into renodx-dev,\nand rebuild the .awc from shaders edited in the live folder.")
+
+        ttk.Frame(sidebar, height=2, bootstyle="secondary").pack(fill=X, pady=20, padx=20)
 
         self.btn_help = ttk.Button(sidebar, text="📖  Help & Docs", style="Sidebar.TButton", command=lambda: ManualWindow(self.root))
         self.btn_help.pack(fill=X, pady=2)
@@ -257,6 +261,7 @@ class ShaderManagerApp:
         self._init_dev_page()
         self._init_fxc_page()
         self._init_awc_page()
+        self._init_renodx_page()
         self._show_page("dev")
 
     def _show_page(self, page_name):
@@ -265,6 +270,8 @@ class ShaderManagerApp:
         self.btn_fxc.configure(bootstyle="dark")
         if hasattr(self, 'btn_awc'):
             self.btn_awc.configure(bootstyle="dark")
+        if hasattr(self, 'btn_renodx'):
+            self.btn_renodx.configure(bootstyle="dark")
 
         if page_name in self.pages:
             self.pages[page_name].pack(fill=BOTH, expand=True)
@@ -280,6 +287,261 @@ class ShaderManagerApp:
             self.lbl_title.config(text="AWC Archives")
             if hasattr(self, 'btn_awc'):
                 self.btn_awc.configure(bootstyle="primary")
+        elif page_name == "renodx":
+            self.lbl_title.config(text="RenoDX Sync")
+            if hasattr(self, 'btn_renodx'):
+                self.btn_renodx.configure(bootstyle="primary")
+
+    # ------------------------------------------------------------------
+    # RenoDX Sync page
+    # ------------------------------------------------------------------
+    def _init_renodx_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["renodx"] = page
+
+        self.renodx_game_var = tk.StringVar(value=self.config["RenoDX"].get("game_path", ""))
+        self.renodx_pretty_var = tk.BooleanVar(value=False)
+        self.renodx_update_meta_var = tk.BooleanVar(value=False)
+        self.renodx_inplace_var = tk.BooleanVar(value=False)
+        self.renodx_dryrun_var = tk.BooleanVar(value=False)
+        self.renodx_paths_var = tk.StringVar(value="")
+
+        intro = ttk.Label(
+            page,
+            text="Bridge RenoDX and the .awc shader library. Set your game folder once, "
+                 "then export the effect map into renodx-dev and rebuild the .awc from "
+                 "shaders you edited in RenoDX's live folder.",
+            wraplength=900, bootstyle="secondary")
+        intro.pack(fill=X, pady=(0, 10))
+
+        # --- Game folder ---
+        gf = ttk.Labelframe(page, text=" Game Folder (contains GTA5_Enhanced.exe) ", padding=10, bootstyle="info")
+        gf.pack(fill=X, pady=(0, 10))
+        row = ttk.Frame(gf); row.pack(fill=X)
+        ttk.Entry(row, textvariable=self.renodx_game_var).pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
+        ttk.Button(row, text="Browse…", command=self._renodx_browse_game, bootstyle="secondary").pack(side=LEFT, padx=2)
+        ttk.Button(row, text="Save", command=self._renodx_save_game_path, bootstyle="primary").pack(side=LEFT, padx=2)
+        ttk.Label(gf, textvariable=self.renodx_paths_var, bootstyle="secondary", font=("Consolas", 9)).pack(fill=X, pady=(8, 0))
+
+        # --- Effect map export ---
+        ef = ttk.Labelframe(page, text=" Effect Map (shader_effects.json) ", padding=10, bootstyle="secondary")
+        ef.pack(fill=X, pady=(0, 10))
+        ttk.Label(ef, text="Builds the hash→effect map from the .awc and writes it into "
+                           "<game>\\renodx-dev so the devkit Shaders tab can group by effect.",
+                  wraplength=900, bootstyle="secondary").pack(fill=X, pady=(0, 8))
+        erow = ttk.Frame(ef); erow.pack(fill=X)
+        ttk.Button(erow, text="▶ Export → renodx-dev", command=self._renodx_export_async, bootstyle="success").pack(side=LEFT)
+        ttk.Checkbutton(erow, text="Pretty (readable JSON)", variable=self.renodx_pretty_var, bootstyle="round-toggle").pack(side=LEFT, padx=15)
+
+        # --- Rebuild AWC from live ---
+        rf = ttk.Labelframe(page, text=" Rebuild .awc from RenoDX Live Folder ", padding=10, bootstyle="warning")
+        rf.pack(fill=X, pady=(0, 10))
+        ttk.Label(rf, text="Compiles shaders from <game>\\renodx-dev\\live, matches each to its "
+                           ".awc slot by hash, and writes an updated .awc (original backed up). "
+                           "Uses the .awc loaded on the AWC tab, or the bundled awc_files if none.",
+                  wraplength=900, bootstyle="secondary").pack(fill=X, pady=(0, 8))
+        orow = ttk.Frame(rf); orow.pack(fill=X)
+        ttk.Checkbutton(orow, text="Update metadata", variable=self.renodx_update_meta_var, bootstyle="round-toggle").pack(side=LEFT, padx=(0, 15))
+        ttk.Checkbutton(orow, text="Overwrite in place", variable=self.renodx_inplace_var, bootstyle="round-toggle").pack(side=LEFT, padx=(0, 15))
+        ttk.Checkbutton(orow, text="Dry run", variable=self.renodx_dryrun_var, bootstyle="round-toggle").pack(side=LEFT)
+        brow = ttk.Frame(rf); brow.pack(fill=X, pady=(8, 0))
+        ttk.Button(brow, text="▶ Rebuild .awc from Live", command=self._renodx_rebuild_async, bootstyle="warning").pack(side=LEFT)
+        ttk.Button(brow, text="📂 Open Live Folder", command=self._renodx_open_live, bootstyle="secondary").pack(side=LEFT, padx=8)
+
+        # --- Full sync ---
+        sf = ttk.Labelframe(page, text=" One-Click Sync ", padding=10, bootstyle="success")
+        sf.pack(fill=X, pady=(0, 10))
+        ttk.Label(sf, text="Rebuild the .awc from live, then re-export the effect map into "
+                           "renodx-dev so the devkit stays in sync after your edits.",
+                  wraplength=900, bootstyle="secondary").pack(fill=X, pady=(0, 8))
+        ttk.Button(sf, text="⟳ Rebuild + Re-export Effects", command=self._renodx_full_sync_async, bootstyle="success-outline").pack(side=LEFT)
+
+        # --- Legacy (DX11) placeholder ---
+        lf = ttk.Labelframe(page, text=" GTA 5 Legacy (DX11) — Coming Soon ", padding=10, bootstyle="secondary")
+        lf.pack(fill=X, pady=(0, 10))
+        ttk.Label(lf, text="The sections above target GTA 5 Enhanced (DX12 / .awc). A Legacy/DX11 "
+                           "version is planned. GTA 5 Legacy stores shaders in .fxc archives where "
+                           "each archive is already an effect group (rather than one big library with "
+                           "an effect table), so the effect-map and rebuild flow will be adapted to "
+                           "that layout. Not available yet.",
+                  wraplength=900, bootstyle="secondary").pack(fill=X, pady=(0, 8))
+        ttk.Button(lf, text="GTA 5 Legacy Sync (Coming Soon)", bootstyle="secondary", state="disabled").pack(side=LEFT)
+
+        self._renodx_update_paths_label()
+
+    def _renodx_browse_game(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Select GTA 5 Enhanced game folder")
+        if d:
+            self.renodx_game_var.set(d)
+            self._renodx_save_game_path()
+
+    def _renodx_save_game_path(self):
+        self.config["RenoDX"]["game_path"] = self.renodx_game_var.get().strip()
+        self.cfg_mgr.save()
+        self._renodx_update_paths_label()
+        self._log(f"RenoDX game folder saved: {self.renodx_game_var.get().strip() or '(none)'}")
+
+    def _renodx_paths(self):
+        """Return (game, renodx_dev, live, sidecar_dest) Path objects, or None."""
+        game = self.renodx_game_var.get().strip()
+        if not game:
+            return None
+        game = os.path.abspath(game)
+        renodx_dev = os.path.join(game, "renodx-dev")
+        return (game, renodx_dev,
+                os.path.join(renodx_dev, "live"),
+                os.path.join(renodx_dev, "shader_effects.json"))
+
+    def _renodx_update_paths_label(self):
+        p = self._renodx_paths()
+        if not p:
+            self.renodx_paths_var.set("No game folder set.")
+            return
+        game, renodx_dev, live, sidecar = p
+        exe = os.path.join(game, "GTA5_Enhanced.exe")
+        ok = "✓" if os.path.exists(exe) else "✗ (GTA5_Enhanced.exe not found here)"
+        self.renodx_paths_var.set(
+            f"{ok}\nlive:    {live}\nsidecar: {sidecar}")
+
+    def _renodx_target_awcs(self):
+        """AWC(s) to operate on.
+
+        GTA5 Enhanced ships the shader library as a PAIR: the big archive
+        (e.g. sga_win32_60_final.awc) and its small companion that ends in
+        '_init.awc'. A given shader lives in exactly one of the two, so we
+        always operate on BOTH so the right file is matched/updated.
+
+        If an .awc is loaded on the AWC tab, use it plus its sibling (found by
+        adding/removing the '_init' suffix in the same folder). Otherwise fall
+        back to the bundled awc_files pair.
+        """
+        loaded = getattr(self, "awc_current_filepath", None)
+        if loaded and os.path.exists(loaded):
+            loaded = os.path.abspath(loaded)
+            folder = os.path.dirname(loaded)
+            stem, ext = os.path.splitext(os.path.basename(loaded))
+            if stem.endswith("_init"):
+                sibling_stem = stem[:-len("_init")]
+            else:
+                sibling_stem = stem + "_init"
+            sibling = os.path.join(folder, sibling_stem + ext)
+            paths = [loaded]
+            if os.path.exists(sibling):
+                paths.append(sibling)
+                return paths, f"loaded AWC + sibling ({os.path.basename(loaded)} + {os.path.basename(sibling)})"
+            return paths, f"loaded AWC ({os.path.basename(loaded)}) — no '_init' sibling found next to it"
+        from rebuild_awc_from_live import _DEFAULT_AWCS
+        return [str(p) for p in _DEFAULT_AWCS], "bundled awc_files (both)"
+
+    def _renodx_open_live(self):
+        p = self._renodx_paths()
+        if not p:
+            self._log("Set the game folder first.")
+            return
+        live = p[2]
+        os.makedirs(live, exist_ok=True)
+        subprocess.Popen(f'explorer "{os.path.abspath(live)}"')
+
+    def _renodx_export_async(self):
+        p = self._renodx_paths()
+        if not p:
+            self._log("Set the game folder first.")
+            return
+        sidecar_dest = p[3]
+        awcs, awc_desc = self._renodx_target_awcs()
+        pretty = self.renodx_pretty_var.get()
+        self.msg_queue.put(("P_START", 1))
+        threading.Thread(target=self._renodx_export_worker,
+                         args=(awcs, awc_desc, sidecar_dest, pretty), daemon=True).start()
+
+    def _renodx_export_worker(self, awcs, awc_desc, sidecar_dest, pretty):
+        try:
+            import export_shader_effects as E
+            self._log(f"Exporting effect map from {awc_desc} ...")
+            os.makedirs(os.path.dirname(sidecar_dest), exist_ok=True)
+            stats = E.export_sidecar(awcs, sidecar_dest, pretty=pretty, log=self._log)
+            self._log(f"Done: {stats['shaders']} shaders / {stats['effects']} effects -> {sidecar_dest}")
+        except Exception as e:
+            self._log(f"Export FAILED: {e}")
+        finally:
+            self.msg_queue.put(("P_STOP", None))
+
+    def _renodx_rebuild_async(self):
+        p = self._renodx_paths()
+        if not p:
+            self._log("Set the game folder first.")
+            return
+        live = p[2]
+        if not os.path.isdir(live):
+            self._log(f"Live folder not found: {live}")
+            return
+        awcs, awc_desc = self._renodx_target_awcs()
+        opts = dict(update_metadata=self.renodx_update_meta_var.get(),
+                    in_place=self.renodx_inplace_var.get(),
+                    dry_run=self.renodx_dryrun_var.get())
+        self.msg_queue.put(("P_START", 1))
+        threading.Thread(target=self._renodx_rebuild_worker,
+                         args=(live, awcs, awc_desc, opts, False), daemon=True).start()
+
+    def _renodx_rebuild_worker(self, live, awcs, awc_desc, opts, then_export):
+        try:
+            import rebuild_awc_from_live as R
+            self._log(f"Rebuilding {awc_desc} from live folder ...")
+            res = R.run_rebuild(
+                live=live, awc=awcs, out_dir=self.dirs["awc"],
+                in_place=opts["in_place"], update_metadata=opts["update_metadata"],
+                dxc_path=self.tools["dxc"], log=self._log, dry_run=opts["dry_run"])
+            if res.get("error"):
+                self._log(f"Rebuild FAILED: {res['error']}")
+                return
+            self._log(f"Rebuild done: {res['changes']} slot(s) updated across "
+                      f"{len(res['written'])} file(s).")
+            if then_export and res["written"] and not opts["dry_run"]:
+                p = self._renodx_paths()
+                if p:
+                    import export_shader_effects as E
+                    self._log("Re-exporting effect map ...")
+                    # Re-export from the COMPLETE set so no file's shaders are
+                    # dropped: use each target's modified copy if it was written,
+                    # otherwise the original. (In-place writes overwrite the
+                    # originals, so the target list is already current.)
+                    if opts["in_place"]:
+                        out_awcs = awcs
+                    else:
+                        written = {os.path.abspath(w) for w in res["written"]}
+                        out_dir = self.dirs["awc"]
+                        out_awcs = []
+                        for a in awcs:
+                            stem = os.path.splitext(os.path.basename(a))[0]
+                            mod = os.path.abspath(os.path.join(out_dir, stem + "_modified.awc"))
+                            out_awcs.append(mod if mod in written else a)
+                    stats = E.export_sidecar(out_awcs, p[3],
+                                             pretty=self.renodx_pretty_var.get(), log=self._log)
+                    self._log(f"Effect map updated: {stats['shaders']} shaders -> {p[3]}")
+            self.config["RenoDX"]["last_sync"] = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+            self.cfg_mgr.save()
+        except Exception as e:
+            self._log(f"Rebuild FAILED: {e}")
+        finally:
+            self.msg_queue.put(("P_STOP", None))
+
+    def _renodx_full_sync_async(self):
+        p = self._renodx_paths()
+        if not p:
+            self._log("Set the game folder first.")
+            return
+        live = p[2]
+        if not os.path.isdir(live):
+            self._log(f"Live folder not found: {live}")
+            return
+        awcs, awc_desc = self._renodx_target_awcs()
+        opts = dict(update_metadata=self.renodx_update_meta_var.get(),
+                    in_place=self.renodx_inplace_var.get(),
+                    dry_run=self.renodx_dryrun_var.get())
+        self.msg_queue.put(("P_START", 1))
+        threading.Thread(target=self._renodx_rebuild_worker,
+                         args=(live, awcs, awc_desc, opts, True), daemon=True).start()
 
     def _init_dev_page(self):
         page = ttk.Frame(self.page_container)
@@ -1314,34 +1576,43 @@ class ShaderManagerApp:
         if "ds_6_0" in fn: return "ds_6_0"
         if "hs_6_0" in fn: return "hs_6_0"
         
+        # No explicit shader model in the filename. Pick the default profile for
+        # the active DX mode: DX12/dxc requires SM6+ (it cannot compile *_5_0),
+        # and GTA5 Enhanced compute shaders are uniformly cs_6_6.
+        dx12 = self.dx_version.get() == "dx12"
+        def _prof(stage):
+            if dx12:
+                return f"{stage}_6_6" if stage == "cs" else f"{stage}_6_0"
+            return f"{stage}_5_0"
+
         folder = os.path.basename(os.path.dirname(path)).upper()
-        if folder == "VS": return "vs_5_0"
-        if folder == "PS": return "ps_5_0"
-        if folder == "CS": return "cs_5_0"
-        if folder == "DS": return "ds_5_0"
-        if folder == "GS": return "gs_5_0"
-        if folder == "HS": return "hs_5_0"
-        
-        if fn.startswith("vs") or "_vs" in fn or "+vs" in fn or ".vsh" in fn: return "vs_5_0"
-        if fn.startswith("ps") or "_ps" in fn or "+ps" in fn or ".psh" in fn: return "ps_5_0"
-        if fn.startswith("cs") or "_cs" in fn or "+cs" in fn or ".csh" in fn: return "cs_5_0"
-        if fn.startswith("ds") or "_ds" in fn: return "ds_5_0"
-        if fn.startswith("gs") or "_gs" in fn: return "gs_5_0"
-        if fn.startswith("hs") or "_hs" in fn: return "hs_5_0"
-        if fn.startswith("hs") or "_hs" in fn: return "hs_5_0"
-        
+        if folder in ("VS", "PS", "CS", "DS", "GS", "HS"):
+            return _prof(folder.lower())
+
+        if fn.startswith("vs") or "_vs" in fn or "+vs" in fn or ".vsh" in fn: return _prof("vs")
+        if fn.startswith("ps") or "_ps" in fn or "+ps" in fn or ".psh" in fn: return _prof("ps")
+        if fn.startswith("cs") or "_cs" in fn or "+cs" in fn or ".csh" in fn: return _prof("cs")
+        if fn.startswith("ds") or "_ds" in fn: return _prof("ds")
+        if fn.startswith("gs") or "_gs" in fn: return _prof("gs")
+        if fn.startswith("hs") or "_hs" in fn: return _prof("hs")
+
         # Fallback: detect shader type from file content
         content_type = self._detect_shader_type_content(path)
-        ver = "6_0" if self.dx_version.get() == "dx12" else "5_0"
-        if content_type == "[VS]": return f"vs_{ver}"
-        if content_type == "[PS]": return f"ps_{ver}"
-        return "ps_5_0"
+        if content_type == "[CS]": return _prof("cs")
+        if content_type == "[VS]": return _prof("vs")
+        if content_type == "[PS]": return _prof("ps")
+        return _prof("ps")
 
     def _detect_shader_type_content(self, path):
         try:
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
-            
+
+            # Compute shaders carry a [numthreads(...)] attribute and have no
+            # SV_Position / SV_Target semantics, so detect them first.
+            if re.search(r'\[\s*numthreads\s*\(', content, re.IGNORECASE):
+                return "[CS]"
+
             # Heuristic from compile_shaders.py
             if "SV_Position" in content and "SV_Target" in content:
                 if re.search(r'out\s+[\w\d\s]+\s*:\s*SV_Position', content, re.IGNORECASE):
@@ -1717,16 +1988,18 @@ class ShaderManagerApp:
             
             cmd = []
             if self.dx_version.get() == "dx12":
-                # DX12: dxc.exe -T <profile> -Fo <out> <in>
-                # Also stripping _5_0 and replacing with _6_0 if legacy profile was detected but we are in DX12 mode?
-                # Actually, user requested auto-detection from name. If name has _6_0 it returns _6_0. 
-                # If it returned _5_0 (default), but we are in DX12 mode, should we upgrade? 
-                # Let's trust the profile returned by _detect_profile. 
-                # However, if it IS vs_5_0, dxc might complain if we want SM6. 
-                # Let's assume user properly named files or we force upgrade if mode is dx12 and profile is 5_0?
-                # The user said: "automatic detection... e.g. .vs_6_0.hlsl - vertex shader 6.0 model"
-                # So if they use old names, they might still get 5.0. DXC supports 5.0? Yes, usually.
-                cmd = [self.tools["dxc"], '-T', prof, '-Fo', tmp, path]
+                # dxc only supports Shader Model 6.0+. If a *_5_0 profile slipped
+                # through (e.g. an explicitly named legacy file compiled in DX12
+                # mode), upgrade it so the compile doesn't fail outright:
+                # compute -> 6_6 (the SM the game uses), everything else -> 6_0.
+                dxc_prof = prof
+                if dxc_prof.endswith("_5_0"):
+                    stage = dxc_prof.split("_", 1)[0]
+                    dxc_prof = f"{stage}_6_6" if stage == "cs" else f"{stage}_6_0"
+                    self._log(f"  -> Upgraded {prof} to {dxc_prof} for DXC (SM6+ required)")
+                # Entry point is 'main' (DXC's default, and what the RenoDX
+                # entry-fix produces). Pass it explicitly to match the workflow.
+                cmd = [self.tools["dxc"], '-T', dxc_prof, '-E', 'main', '-Fo', tmp, path]
             else:
                 # DX11
                 cmd = [self.tools["fxc"], '/nologo', '/T', prof, '/E', 'main', '/Fo', tmp, path]
@@ -2057,6 +2330,7 @@ class ShaderManagerApp:
             self._worker_awc_repack(p)
             self.msg_queue.put(("P_STEP", None))
         self.msg_queue.put(("P_STOP", None))
+        self.msg_queue.put(("REFRESH", None))
 
     def _worker_awc_repack(self, p):
         try:

@@ -34,3 +34,10 @@ hash.txt
 
 # Settings (user-specific)
 settings.ini
+
+# Generated shader-effect sidecars (large; regenerate via export_shader_effects.py)
+shader_effects.json
+shader_effects.pretty.json
+
+# Local workflow notes (not shipped)
+SHADER_WORKFLOW_GUIDE.md

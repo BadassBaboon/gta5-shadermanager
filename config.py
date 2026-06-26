@@ -21,6 +21,10 @@ class ConfigManager:
                 "mode": "source",
                 "theme": "solar",
                 "show_welcome_banner": "true"
+            },
+            "RenoDX": {
+                "game_path": "",
+                "last_sync": ""
             }
         }
 

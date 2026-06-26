@@ -5,9 +5,81 @@ Supports full rebuild when shader sizes change.
 """
 
 import struct
+import subprocess
+import tempfile
+import configparser
+from pathlib import Path
 from typing import BinaryIO, List, Optional, Tuple, Dict
 from .models import AWCFile, Shader, Register, CBufferData, ValueType, ResourceType
 from .dxbc_parser import scan_shader
+
+
+def _find_dxc(dxc_path=None):
+    """Locate dxc.exe: explicit path, else settings.ini's dx12_compiler_path under the
+    shadermanager root, else dxcompilers/dxc.exe. Returns Path or None."""
+    if dxc_path:
+        p = Path(dxc_path)
+        if p.exists():
+            return p
+    root = Path(__file__).resolve().parent.parent  # shadermanager/
+    rel = "dxcompilers/dxc.exe"
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(root / "settings.ini")
+        rel = cfg.get("Paths", "dx12_compiler_path", fallback=rel)
+    except Exception:
+        pass
+    p = root / rel
+    return p if p.exists() else None
+
+
+def _dxbc_chunks(blob: bytes):
+    """Return the list of 4-byte chunk FourCCs in a DXBC/DXIL container."""
+    if not blob or len(blob) < 32 or blob[:4] != b'DXBC':
+        return []
+    try:
+        n = struct.unpack_from('<I', blob, 28)[0]
+        return [blob[o:o + 4] for o in struct.unpack_from(f'<{n}I', blob, 32)]
+    except Exception:
+        return []
+
+
+def transplant_rootsig(old_binary: bytes, new_binary: bytes, dxc) -> Tuple[Optional[bytes], str]:
+    """Copy the ORIGINAL shader's embedded root signature (RTS0) onto a freshly compiled
+    shader and re-sign it, so the injected shader keeps a PSO-valid root signature.
+
+    Every stock GTA5 Enhanced shader embeds an RTS0 chunk; the game builds its PSOs from
+    that signature. Recompiled HLSL emits no RTS0, so without this the injected shader fails
+    PSO creation -> the game can crash or the effect silently never runs.
+
+    Returns (patched_bytes, message):
+      - (new_binary, 'no root signature in original') -- stock shader has no RTS0, inject as-is.
+      - (patched_bytes, 'ok') -- success, RTS0 spliced in and re-signed.
+      - (None, '<reason>') -- the original HAS a root sig but it can't be attached (the
+        modified shader binds a resource the stock root sig lacks) OR dxc is unavailable.
+        The caller MUST NOT inject in that case; doing so risks a GPU/PSO crash.
+    """
+    if b'RTS0' not in _dxbc_chunks(old_binary):
+        return new_binary, 'no root signature in original'
+    if dxc is None or not Path(dxc).exists():
+        return None, 'dxc.exe not found -- cannot validate/preserve root signature'
+    dxc = str(dxc)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / 'old.cso').write_bytes(old_binary)
+        (td / 'new.cso').write_bytes(new_binary)
+        r = subprocess.run([dxc, '-dumpbin', str(td / 'old.cso'),
+                            '-extractrootsignature', '-Fo', str(td / 'rs.bin')],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not (td / 'rs.bin').exists() or (td / 'rs.bin').stat().st_size == 0:
+            return None, 'failed to extract original root signature'
+        r = subprocess.run([dxc, '-dumpbin', str(td / 'new.cso'),
+                            '-setrootsignature', str(td / 'rs.bin'), '-Fo', str(td / 'final.cso')],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not (td / 'final.cso').exists():
+            tail = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'setrootsignature failed'
+            return None, f'root signature incompatible: {tail}'
+        return (td / 'final.cso').read_bytes(), 'ok'
 
 
 class AWCWriter:
@@ -369,12 +441,19 @@ def rebuild_awc(awc: AWCFile, original_path: str, output_path: str):
     rebuilder.write(output_path)
 
 
-def import_shader(awc: AWCFile, shader_type: str, shader_index: int, 
-                  cso_path: str, update_metadata: bool = False) -> Tuple[bool, str]:
+def import_shader(awc: AWCFile, shader_type: str, shader_index: int,
+                  cso_path: str, update_metadata: bool = False,
+                  preserve_rootsig: bool = True, dxc_path: str = None) -> Tuple[bool, str]:
     """
     Import a CSO file as a shader replacement.
     If update_metadata is True, auto-detects resources and updates metadata.
     If False (default), only replaces the shader binary.
+
+    preserve_rootsig (default True): splice the ORIGINAL slot's embedded root signature
+    onto the new bytecode and re-sign (see transplant_rootsig). If the new shader can't
+    take the stock root signature, the import is REFUSED (returns False) and the slot is
+    left unchanged -- this prevents injecting a shader that crashes the game at PSO
+    creation. Set False only for deliberate raw swaps. dxc_path overrides dxc autodetect.
     """
     shader_lists = {
         'vertex': awc.vertex_shaders,
@@ -412,7 +491,19 @@ def import_shader(awc: AWCFile, shader_type: str, shader_index: int,
     
     shader = shader_list[shader_index]
     old_size = shader.size
-    
+
+    # --- ROOT SIGNATURE PRESERVATION (prevents PSO-creation crashes) ---
+    # shader.shader_binary here is still the ORIGINAL stock blob (we haven't swapped yet).
+    # Splice its RTS0 onto the new bytecode; if that fails the new shader is incompatible
+    # with the stock root signature, so refuse the import and leave the slot stock.
+    if preserve_rootsig:
+        patched, rs_msg = transplant_rootsig(
+            shader.shader_binary, new_binary, _find_dxc(dxc_path))
+        if patched is None:
+            return False, (f"Root signature not preserved ({rs_msg}); "
+                           f"slot left unchanged to avoid a GPU crash")
+        new_binary = patched
+
     # Update shader binary
     shader.shader_binary = new_binary
     shader.size = len(new_binary)

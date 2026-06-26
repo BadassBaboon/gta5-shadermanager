@@ -32,6 +32,7 @@ class ManualWindow(BaseToplevel):
         self._safe_add_tab("DX11 vs DX12", self._text_comparison)
         self._safe_add_tab("FXC Archives", self._text_fxc)
         self._safe_add_tab("AWC Archives", self._text_awc)
+        self._safe_add_tab("RenoDX Sync", self._text_renodx)
         self._safe_add_tab("Smart Compiling", self._text_smart_compile)
         self._safe_add_tab("Global Defines", self._text_defines)
         self._safe_add_tab("Shortcuts & Tips", self._text_shortcuts)
@@ -90,6 +91,7 @@ class ManualWindow(BaseToplevel):
             ("list", "• Auto-compile shaders on file save (watch mode)"),
             ("list", "• Bulk-edit #define values across all shader files"),
             ("list", "• View disassembled shader bytecode (ASM)"),
+            ("list", "• Sync with RenoDX: export an effect map and rebuild the .awc from live-edited shaders (DX12 / Enhanced)"),
             ("body", ""),
 
             ("h1", "Folder Structure"),
@@ -430,6 +432,89 @@ class ManualWindow(BaseToplevel):
             ("warn", "⚠ Leave this OFF unless you know what you're doing."),
             ("body", "When enabled, shader metadata (register bindings, sizes) is recalculated when importing a CSO. This is necessary if you change the shader's interface (add/remove registers), but can cause game crashes if the metadata doesn't match the engine's expectations."),
             ("body", "For simple edits that don't change the shader interface, leave it OFF."),
+        ]
+
+    def _text_renodx(self):
+        return [
+            ("h1", "RenoDX Sync"),
+            ("body", "This page bridges RenoDX (the in-game shader injector / devkit) and the GTA 5 Enhanced .awc shader library. It lets you (1) export an effect map so RenoDX's devkit can group shaders by effect, and (2) rebuild the .awc from shaders you edited live in RenoDX — without the unpack/repack round-trip."),
+            ("warn", "⚠ This feature is for GTA 5 Enhanced (DX12) only."),
+            ("body", ""),
+
+            ("h2", "How RenoDX identifies shaders"),
+            ("body", "RenoDX names every shader by a 32-bit hash = CRC32 of its DXBC/DXIL bytecode. The .awc stores that exact bytecode, so the same CRC32 links an .awc shader to its RenoDX hash. This is the key both features rely on (verified byte-identical against a live RenoDX dump)."),
+            ("body", ""),
+
+            ("h1", "The Effect Map (shader_effects.json)"),
+            ("body", "A small JSON the RenoDX devkit reads to show which effect group a shader belongs to (e.g. PS_VehicleTextured… → vehicle_paint1) and to sort/group the Shaders tab by effect."),
+            ("body", "It maps each shader's RenoDX hash → shader name, stage, and the effect(s) that reference it. The map is built from BOTH .awc files (the big archive plus its small '_init' companion), covering every shader."),
+            ("bold", "Where it goes:"),
+            ("code", "  <game folder>\\renodx-dev\\shader_effects.json"),
+            ("body", "The devkit loads it from there automatically. The effect feature is gated to GTA 5 Enhanced (the devkit only activates it when the host process is GTA5_Enhanced.exe)."),
+            ("body", ""),
+
+            ("h1", "Page Walkthrough"),
+
+            ("h2", "1. Game Folder"),
+            ("body", "Set the folder that contains GTA5_Enhanced.exe (Browse… then Save — it's remembered in settings.ini under [RenoDX]). The page derives and shows the renodx-dev, live, and sidecar paths, with a ✓/✗ on whether the exe is found there."),
+            ("body", ""),
+
+            ("h2", "2. Export → renodx-dev"),
+            ("body", "Builds shader_effects.json from the .awc and writes it straight into <game>\\renodx-dev — no manual copying. Uses the .awc loaded on the AWC tab (plus its '_init' sibling), or the bundled awc_files pair if none is loaded."),
+            ("bold", "Pretty (readable JSON):"),
+            ("body", "  Writes indented JSON for human reading. The compact form is smaller; the devkit reads either."),
+            ("body", ""),
+
+            ("h2", "3. Rebuild .awc from Live"),
+            ("body", "Takes the shaders you edited in RenoDX's live folder and injects them back into the .awc."),
+            ("bold", "How the live folder works:"),
+            ("body", "  RenoDX live-loads shaders from <game>\\renodx-dev\\live, named by the ORIGINAL shader's hash:"),
+            ("code", "  0x06E3253E.ps_6_0.hlsl     (edited HLSL — recompiled by this tool)"),
+            ("code", "  0x06E3253E.ps_6_0.cso      (precompiled binary — used as-is)"),
+            ("body", "For each file, the tool compiles HLSL with dxc (matching the DX12 profile in the name), finds which .awc slot that hash belongs to by CRC32, swaps the bytecode, and writes an updated .awc. The original is backed up to /awc_files/backups/ first."),
+            ("bold", "Toggles:"),
+            ("list", "• Update metadata — rebuild register/cbuffer reflection from the new shader. Needed ONLY if your edit changes the resource signature (adds/removes a texture or cbuffer). Leave OFF for math-only edits."),
+            ("list", "• Overwrite in place — write back into the source .awc (after backup) instead of a separate <name>_modified.awc."),
+            ("list", "• Dry run — report what would change, write nothing."),
+            ("bold", "📂 Open Live Folder:"),
+            ("body", "  Opens <game>\\renodx-dev\\live in Explorer (creates it if missing)."),
+            ("body", ""),
+
+            ("h2", "4. One-Click Sync (Rebuild + Re-export)"),
+            ("body", "Runs the rebuild, then re-exports the effect map FROM the freshly modified .awc so the devkit stays accurate."),
+            ("warn", "Why re-export is required after editing:"),
+            ("body", "When you edit a shader its bytecode changes, so its CRC32 hash changes (old → new). The .awc now holds the new bytecode, but the old shader_effects.json still keys that shader under its old hash. Until you re-export, the devkit won't find the edited shader's effect label. Re-export re-keys it under the new hash. (The shader's effect membership doesn't change — only its hash.)"),
+            ("body", ""),
+
+            ("h1", "Two .awc Files (Pair)"),
+            ("body", "GTA 5 Enhanced ships the shader library as a pair: the big archive (sga_win32_60_final.awc) and a small companion ending in '_init.awc'. Each shader lives in exactly one of the two. The page always operates on BOTH so the right file is matched and updated — and the effect map covers all shaders from both."),
+            ("body", ""),
+
+            ("h1", "Full Loop"),
+            ("list", "1. Set the game folder once (Save)."),
+            ("list", "2. Edit a shader in RenoDX's live folder; verify the look in-game."),
+            ("list", "3. Click ⟳ Rebuild + Re-export Effects."),
+            ("list", "4. Repack the updated .awc into update.rpf with CodeWalker (Edit Mode)."),
+            ("body", "Once the game runs the modified .awc, the devkit's Effect column matches because the map was rebuilt from that same .awc."),
+            ("body", ""),
+
+            ("h1", "Devkit Side (one-time)"),
+            ("list", "• Build/obtain renodx-devkit.addon64 and load it in the game with ReShade."),
+            ("list", "• The Shaders tab shows an 'Effect' column (sortable) once shader_effects.json is present. 'Reload Effects' re-reads it; 'List All Loaded' shows every loaded shader without a snapshot."),
+            ("body", ""),
+
+            ("h2", "CLI equivalents"),
+            ("body", "The same actions are available as scripts (run from the shadermanager folder):"),
+            ("code", "  python export_shader_effects.py                 # build the map"),
+            ("code", "  python rebuild_awc_from_live.py --live \"<game>\\renodx-dev\\live\" --regen-sidecar"),
+            ("tip", "Tip: Start with simple, math-only edits and the metadata toggle OFF. Reach for 'Update metadata' only when an edit changes the shader's inputs/outputs or resource bindings."),
+            ("body", ""),
+
+            ("h1", "GTA 5 Legacy (DX11) — Coming Soon"),
+            ("body", "Everything above is for GTA 5 Enhanced (DX12 / .awc). A Legacy/DX11 version of RenoDX Sync is planned but not available yet."),
+            ("bold", "Why it needs a separate flow:"),
+            ("body", "GTA 5 Legacy stores shaders in .fxc archives, and each .fxc is already an effect group (e.g. vehicle.fxc) — unlike the Enhanced .awc, which is one big library with an internal effect table. So the effect map would derive groups from the .fxc archive each shader came from, and the rebuild flow would inject live-edited shaders back into the right .fxc rather than a single library."),
+            ("body", "The hash link is the same idea (RenoDX hashes shader bytecode), so the Enhanced groundwork carries over; only the grouping source and repack target change."),
         ]
 
     def _text_smart_compile(self):
