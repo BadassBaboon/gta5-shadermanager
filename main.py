@@ -8,6 +8,17 @@ import queue
 import time
 import traceback
 import sys
+import zlib
+
+
+def renodx_hash(data):
+    """RenoDX runtime shader hash = zlib/IEEE CRC-32 over the bytecode blob
+    (reproduces RenoDX utils::hash::ComputeCRC32). Lets the GUI show the same
+    0xXXXXXXXX RenoDX displays in-game, computed offline from the stored
+    bytecode. NOTE: this is NOT the DXBC/DXIL container's embedded checksum,
+    and NOT the AWC's 64-bit SGA hash -- it's a CRC-32 of the whole blob."""
+    return f"0x{zlib.crc32(data) & 0xFFFFFFFF:08X}" if data else ""
+
 
 # --- MODULES IMPORT ---
 try:
@@ -764,14 +775,16 @@ class ShaderManagerApp:
         self.fxc_shader_search_var.trace_add("write", lambda *args: self._fxc_populate_tree())
         ttk.Entry(sh_search_fr, textvariable=self.fxc_shader_search_var).pack(side=LEFT, fill=X, expand=True)
 
-        cols_s = ("type", "size")
+        cols_s = ("renohash", "type", "size")
         tree_container, self.fxc_shader_tree = self._create_scrolled_tree(middle_fr, columns=cols_s, show="tree headings", bootstyle="info")
         tree_container.pack(fill=BOTH, expand=True)
-        
+
         self.fxc_shader_tree.heading("#0", text="Shader Name", anchor="w")
+        self.fxc_shader_tree.heading("renohash", text="RenoDX Hash", anchor="w")
         self.fxc_shader_tree.heading("type", text="Type", anchor="w")
         self.fxc_shader_tree.heading("size", text="Size (Bytes)", anchor="e")
         self.fxc_shader_tree.column("#0", width=250)
+        self.fxc_shader_tree.column("renohash", width=95, anchor="w")
         self.fxc_shader_tree.column("type", width=80)
         self.fxc_shader_tree.column("size", width=100, anchor="e")
         self.fxc_shader_tree.bind("<<TreeviewSelect>>", self._on_fxc_shader_select)
@@ -849,9 +862,9 @@ class ShaderManagerApp:
                     
             if not filtered: continue
             
-            cat_id = self.fxc_shader_tree.insert("", "end", text=f"{cat_name} ({len(filtered)})", values=("", ""), open=True)
+            cat_id = self.fxc_shader_tree.insert("", "end", text=f"{cat_name} ({len(filtered)})", values=("", "", ""), open=True)
             for s in filtered:
-                item_id = self.fxc_shader_tree.insert(cat_id, "end", text=s.Name, values=(sh_type, f"{len(s.ByteCode):,}"))
+                item_id = self.fxc_shader_tree.insert(cat_id, "end", text=s.Name, values=(renodx_hash(s.ByteCode), sh_type, f"{len(s.ByteCode):,}"))
                 self.fxc_shader_map[item_id] = s
 
     def _on_fxc_shader_select(self, event):
@@ -861,6 +874,7 @@ class ShaderManagerApp:
             self.fxc_current_shader = shader
             
             details = f"Name: {shader.Name}\n"
+            details += f"RenoDX Hash: {renodx_hash(shader.ByteCode)}\n"
             details += f"Binary Size: {len(shader.ByteCode):,} bytes\n"
             version_str = f"{shader.VersionMajor}.{shader.VersionMinor}"
             details += f"DXBC Version: {version_str}\n\n"
@@ -924,7 +938,7 @@ class ShaderManagerApp:
             if sel:
                 vals = self.fxc_shader_tree.item(sel[0], "values")
                 if vals:
-                    self.fxc_shader_tree.item(sel[0], values=(vals[0], f"{len(shader.ByteCode):,}"))
+                    self.fxc_shader_tree.item(sel[0], values=(renodx_hash(shader.ByteCode), vals[1], f"{len(shader.ByteCode):,}"))
             
             # Refresh the details panel
             self._on_fxc_shader_select(None)
@@ -1105,14 +1119,16 @@ class ShaderManagerApp:
         chk_coarse.pack(side=LEFT, padx=(4, 0))
         hint(chk_coarse, "When ON, related family tokens collapse into broad buckets\n(Vehicle*, VehicleTextured*, VehicleTransform* → vehicle).\nWhen OFF, every distinct token is its own group (~700+ groups).")
         
-        cols_s = ("type", "size")
+        cols_s = ("renohash", "type", "size")
         tree_container, self.awc_tree = self._create_scrolled_tree(middle_fr, columns=cols_s, show="tree headings", bootstyle="info")
         tree_container.pack(fill=BOTH, expand=True)
         
         self.awc_tree.heading("#0", text="Shader Hash / Name", anchor="w")
+        self.awc_tree.heading("renohash", text="RenoDX Hash", anchor="w")
         self.awc_tree.heading("type", text="Type", anchor="w")
         self.awc_tree.heading("size", text="Size (Bytes)", anchor="e")
         self.awc_tree.column("#0", width=250)
+        self.awc_tree.column("renohash", width=95, anchor="w")
         self.awc_tree.column("type", width=80)
         self.awc_tree.column("size", width=100, anchor="e")
         self.awc_tree.bind("<<TreeviewSelect>>", self._on_awc_select)
@@ -1289,9 +1305,9 @@ class ShaderManagerApp:
                 if tech_count:
                     label += f", {tech_count} techs, {pass_count} passes"
                 label += ")"
-                group_id = self.awc_tree.insert("", "end", text=label, values=(type_summary, ""), open=False)
+                group_id = self.awc_tree.insert("", "end", text=label, values=("", type_summary, ""), open=False)
                 for s, sh_type, gi, _ in sorted(members, key=lambda x: (x[1], x[0].name.lower())):
-                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(renodx_hash(s.shader_binary), sh_type, f"{s.size:,}"))
                     self.awc_shader_map[item_id] = s
 
             # Orphans: any shader not referenced by any effect.
@@ -1304,9 +1320,9 @@ class ShaderManagerApp:
                         continue
                     orphans.append((s, sh_type))
             if orphans:
-                orphan_id = self.awc_tree.insert("", "end", text=f"❓ Unreferenced ({len(orphans)})", values=("", ""), open=False)
+                orphan_id = self.awc_tree.insert("", "end", text=f"❓ Unreferenced ({len(orphans)})", values=("", "", ""), open=False)
                 for s, sh_type in sorted(orphans, key=lambda x: (x[1], x[0].name.lower())):
-                    item_id = self.awc_tree.insert(orphan_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    item_id = self.awc_tree.insert(orphan_id, "end", text=s.name, values=(renodx_hash(s.shader_binary), sh_type, f"{s.size:,}"))
                     self.awc_shader_map[item_id] = s
         elif group_by_family:
             all_shaders = []
@@ -1338,9 +1354,9 @@ class ShaderManagerApp:
                 type_summary = "/".join(types_in_group)
                 icon = "📛" if key in namespaced else ("❓" if key == '_untitled' else "📦")
                 label = "Untitled / Hash-only" if key == '_untitled' else key
-                group_id = self.awc_tree.insert("", "end", text=f"{icon} {label} ({len(group)})", values=(type_summary, ""), open=False)
+                group_id = self.awc_tree.insert("", "end", text=f"{icon} {label} ({len(group)})", values=("", type_summary, ""), open=False)
                 for s, sh_type in sorted(group, key=lambda x: x[0].name.lower()):
-                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    item_id = self.awc_tree.insert(group_id, "end", text=s.name, values=(renodx_hash(s.shader_binary), sh_type, f"{s.size:,}"))
                     self.awc_shader_map[item_id] = s
         else:
             # Default: group by shader type category
@@ -1354,9 +1370,9 @@ class ShaderManagerApp:
                         
                 if not filtered: continue
                 
-                cat_id = self.awc_tree.insert("", "end", text=f"{cat_name} ({len(filtered)})", values=("", ""), open=True)
+                cat_id = self.awc_tree.insert("", "end", text=f"{cat_name} ({len(filtered)})", values=("", "", ""), open=True)
                 for s in filtered:
-                    item_id = self.awc_tree.insert(cat_id, "end", text=s.name, values=(sh_type, f"{s.size:,}"))
+                    item_id = self.awc_tree.insert(cat_id, "end", text=s.name, values=(renodx_hash(s.shader_binary), sh_type, f"{s.size:,}"))
                     self.awc_shader_map[item_id] = s
 
     def _on_awc_select(self, event):
@@ -1368,7 +1384,8 @@ class ShaderManagerApp:
             self.awc_current_shader = shader
             
             details = f"Name: {shader.name}\n"
-            details += f"Hash: 0x{shader.hash:016X}\n"
+            details += f"RenoDX Hash: {renodx_hash(shader.shader_binary)}\n"
+            details += f"SGA Hash: 0x{shader.hash:016X}\n"
             details += f"Binary Size: {shader.size:,} bytes\n"
             wavesize_desc = {50: "Wave32", 65: "Wave64 (preferred)", 66: "Wave64 (required)"}.get(shader.wavesize, f"Unknown")
             details += f"Wave Size: {wavesize_desc} (0x{shader.wavesize:02X})\n"
@@ -1457,7 +1474,7 @@ class ShaderManagerApp:
             if sel:
                 vals = self.awc_tree.item(sel[0], "values")
                 if vals:
-                    self.awc_tree.item(sel[0], values=(vals[0], f"{shader.size:,}"))
+                    self.awc_tree.item(sel[0], values=(renodx_hash(shader.shader_binary), vals[1], f"{shader.size:,}"))
             
             # Refresh the details panel
             self._on_awc_select(None)

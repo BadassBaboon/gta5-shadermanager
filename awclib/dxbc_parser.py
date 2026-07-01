@@ -1,4 +1,4 @@
-import struct
+﻿import struct
 import re
 import os
 import subprocess
@@ -252,8 +252,8 @@ def scan_shader(binary_path: str, tools_dir: str = None) -> List[ResourceDef]:
     # We need decomp.exe
     if not tools_dir:
          # Try to locate tools dir relative to current file or use default
-         # Based on user's structure: r:\CoreFXProject\GTATOOLS\fxc\fxc-converter-v0.0.2\dxcompilers
-         tools_dir = r"r:\CoreFXProject\GTATOOLS\fxc\fxc-converter-v0.0.2\dxcompilers"
+         # Based on user's structure: r:\CoreFXProject\_TOOLS\GTATOOLS\fxc\fxc-converter-v0.0.2\dxcompilers
+         tools_dir = r"r:\CoreFXProject\_TOOLS\GTATOOLS\fxc\fxc-converter-v0.0.2\dxcompilers"
          
     decomp_exe = os.path.join(tools_dir, "decomp.exe")
     if not os.path.exists(decomp_exe):

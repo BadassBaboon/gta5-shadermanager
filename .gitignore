@@ -41,3 +41,9 @@ shader_effects.pretty.json
 
 # Local workflow notes (not shipped)
 SHADER_WORKFLOW_GUIDE.md
+
+# Reference clones (nested repos, huge, upstream) — never push
+reference/
+
+# Working deliverables (per-shader trace outputs, regenerable)
+_rtshadow_trace_deliverable/

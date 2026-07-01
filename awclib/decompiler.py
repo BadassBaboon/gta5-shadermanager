@@ -1,4 +1,4 @@
-"""
+﻿"""
 Shader decompiler module.
 Exports shader binary from AWC and decompiles using decomp.exe for DXBC shaders.
 """
@@ -12,7 +12,7 @@ from .models import Shader
 
 
 # Default paths to decompiler tools (can be configured)
-DEFAULT_TOOLS_DIR = r"R:\CoreFXProject\GTATOOLS\fxc\fxc-converter-v0.0.2\dxcompilers"
+DEFAULT_TOOLS_DIR = r"R:\CoreFXProject\_TOOLS\GTATOOLS\fxc\fxc-converter-v0.0.2\dxcompilers"
 
 
 class ShaderDecompiler:
