@@ -29,7 +29,7 @@ import sys
 import zlib
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))  # src/ (holds the awclib package)
 from awclib.parser import parse_awc_file
 
 _HERE = Path(__file__).parent

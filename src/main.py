@@ -38,11 +38,11 @@ if not hasattr(ttk, 'PanedWindow') and hasattr(ttk, 'Panedwindow'):
 
 # Import local modules with error handling
 try:
-    import fxc_parser
-    from config import ConfigManager
-    from manual import ManualWindow
-    from defines import DefineManagerWindow
-    from tooltips import hint
+    from core import fxc_parser
+    from core.config import ConfigManager
+    from ui.manual import ManualWindow
+    from core.defines import DefineManagerWindow
+    from ui.tooltips import hint
     from tkinter import filedialog, messagebox
     from awclib.parser import parse_awc_file
     from awclib.awc_writer import AWCRebuilder
@@ -50,7 +50,7 @@ try:
     from awclib.decompiler import decompile_shader
 except ImportError as e:
     print(f"Critical Import Error: {e}")
-    print("Ensure fxc_parser.py, config.py, manual.py, defines.py, tooltips.py and awclib folder are in the same folder.")
+    print("Ensure the src/ package (core/, ui/, tools/, awclib/) is intact and run from the shadermanager root.")
 
 # --- ASM WINDOW CLASS ---
 class AsmWindow(ttk.Toplevel):
@@ -111,7 +111,9 @@ class ShaderManagerApp:
         if getattr(sys, 'frozen', False):
             self.base_dir = os.path.dirname(sys.executable)
         else:
-            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+            # main.py now lives in src/; data folders (source, compiled, dxcompilers, ...)
+            # stay at the shadermanager root, one level up from src/.
+            self.base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
         self.dirs = {
             "source": os.path.join(self.base_dir, "source"),
@@ -442,7 +444,7 @@ class ShaderManagerApp:
                 paths.append(sibling)
                 return paths, f"loaded AWC + sibling ({os.path.basename(loaded)} + {os.path.basename(sibling)})"
             return paths, f"loaded AWC ({os.path.basename(loaded)}) — no '_init' sibling found next to it"
-        from rebuild_awc_from_live import _DEFAULT_AWCS
+        from tools.rebuild_awc_from_live import _DEFAULT_AWCS
         return [str(p) for p in _DEFAULT_AWCS], "bundled awc_files (both)"
 
     def _renodx_open_live(self):
@@ -468,7 +470,7 @@ class ShaderManagerApp:
 
     def _renodx_export_worker(self, awcs, awc_desc, sidecar_dest, pretty):
         try:
-            import export_shader_effects as E
+            from tools import export_shader_effects as E
             self._log(f"Exporting effect map from {awc_desc} ...")
             os.makedirs(os.path.dirname(sidecar_dest), exist_ok=True)
             stats = E.export_sidecar(awcs, sidecar_dest, pretty=pretty, log=self._log)
@@ -497,7 +499,7 @@ class ShaderManagerApp:
 
     def _renodx_rebuild_worker(self, live, awcs, awc_desc, opts, then_export):
         try:
-            import rebuild_awc_from_live as R
+            from tools import rebuild_awc_from_live as R
             self._log(f"Rebuilding {awc_desc} from live folder ...")
             res = R.run_rebuild(
                 live=live, awc=awcs, out_dir=self.dirs["awc"],
@@ -511,7 +513,7 @@ class ShaderManagerApp:
             if then_export and res["written"] and not opts["dry_run"]:
                 p = self._renodx_paths()
                 if p:
-                    import export_shader_effects as E
+                    from tools import export_shader_effects as E
                     self._log("Re-exporting effect map ...")
                     # Re-export from the COMPLETE set so no file's shaders are
                     # dropped: use each target's modified copy if it was written,

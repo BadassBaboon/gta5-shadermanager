@@ -7,7 +7,7 @@ REM ========================================================
 REM  Configuration
 REM ========================================================
 set "APP_NAME=GTA5ShaderManager"
-set "MAIN_SCRIPT=main.py"
+set "MAIN_SCRIPT=src\main.py"
 set "REQUIRED_PACKAGES=pyinstaller ttkbootstrap configparser"
 
 echo ========================================================

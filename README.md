@@ -67,8 +67,20 @@ pip install ttkbootstrap
 
 ## Quick Start
 
+Run from the shadermanager root (data folders — `dxcompilers/`, `source/`, etc. — live here; the code lives in `src/`):
+
 ```bash
-python main.py
+python src/main.py
+```
+
+### Layout
+```
+src/
+  main.py            entry point
+  core/              config.py, defines.py, fxc_parser.py
+  ui/                manual.py, tooltips.py
+  tools/             export_shader_effects.py, rebuild_awc_from_live.py, verify_renodx_hash.py
+  awclib/            AWC parse/write/inject package
 ```
 
 ---
