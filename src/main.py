@@ -2261,25 +2261,38 @@ class ShaderManagerApp:
                         
                         res2 = subprocess.run(spirv_cmd, capture_output=True, text=True, cwd=self.dirs["compilers"])
                         
-                        # If failed, retry without --hlsl-preserve-structured-buffers (helps with complex cbuffer layouts)
+                        # Escalating fallback tiers, each targeting a different
+                        # spirv-cross limitation. Shaders that succeed on tier 1
+                        # are unaffected; later tiers only run on failure.
+                        _base_opts = ["--hlsl", "--shader-model", shader_model,
+                                      "--hlsl-enable-16bit-types", "--relax-nan-checks",
+                                      "--output", target_file]
                         if res2.returncode != 0:
-                            self._log(f"Retrying with fallback options...")
-                            spirv_cmd_fallback = [
-                                self.tools["spirv_cross"], temp_spv,
-                                "--hlsl",
-                                "--shader-model", shader_model,
-                                "--hlsl-enable-16bit-types",
-                                "--relax-nan-checks",
-                                "--output", target_file
-                            ]
-                            res2 = subprocess.run(spirv_cmd_fallback, capture_output=True, text=True, cwd=self.dirs["compilers"])
-                        
+                            # Tier 2: drop --hlsl-preserve-structured-buffers
+                            # (helps some complex cbuffer layouts).
+                            res2 = subprocess.run([self.tools["spirv_cross"], temp_spv] + _base_opts,
+                                                  capture_output=True, text=True, cwd=self.dirs["compilers"])
+                        if res2.returncode != 0:
+                            # Tier 3: --flatten-ubo rescues shaders whose $Globals
+                            # holds a (statically-indexed) scalar float array that
+                            # HLSL cbuffers can't 16-byte-align.
+                            res2 = subprocess.run([self.tools["spirv_cross"], temp_spv, "--flatten-ubo"] + _base_opts,
+                                                  capture_output=True, text=True, cwd=self.dirs["compilers"])
+
                         # Clean up temp SPIR-V file
                         if os.path.exists(temp_spv):
                             os.remove(temp_spv)
-                        
+
                         if res2.returncode != 0:
-                            self._log(f"Error (spirv-cross): {res2.stderr}")
+                            err = (res2.stderr or "").strip()
+                            if "packoffset" in err or "Array stride" in err:
+                                # Known spirv-cross limitation: a dynamically-indexed
+                                # scalar array in a constant buffer can't be expressed
+                                # as an HLSL cbuffer. Not a container/pipeline fault.
+                                self._log(f"  -> Skipped {base}: constant buffer has a dynamically-indexed "
+                                          f"scalar array spirv-cross can't express as HLSL (decompiler limitation).")
+                            else:
+                                self._log(f"Error (spirv-cross): {err}")
                         else:
                             self._log(f"Decompiled: {base}.hlsl")
 
