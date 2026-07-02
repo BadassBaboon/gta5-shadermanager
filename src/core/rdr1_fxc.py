@@ -31,6 +31,11 @@ from dataclasses import dataclass
 
 DXBC_MAGIC = b"DXBC"
 NAME_RE = re.compile(rb"\b(?:VS|PS|CS|GS|HS|DS)[A-Za-z0-9_]{2,}\b")
+# A shader entry name starts with a stage tag (vs/ps/cs/gs/hs/ds, either case)
+# followed by '_' or a letter -- this matches 'vs_MiniSky', 'ps_main',
+# 'VSTerrain', 'PSTerrain_Flatten' while excluding the 'g...'/'MoonSpace...'
+# parameter names and 'NULL' placeholders that also live in the record.
+SHADER_NAME_RE = re.compile(r"^(?:vs|ps|cs|gs|hs|ds)(?:_|[A-Za-z])", re.IGNORECASE)
 MANIFEST = "rdr1_manifest.json"
 
 
@@ -57,10 +62,40 @@ def _dxbc_size(data: bytes, offset: int) -> int:
     return size
 
 
+def _pascal_strings(prelude: bytes) -> list[str]:
+    """Walk the record's length-prefixed pascal strings (length byte counts the
+    trailing NUL). Records are a run of such strings (shader name, then the
+    parameter-name table); a leading 'rgxd' file header on the first record and
+    stray non-string bytes are skipped by advancing one byte on a bad parse."""
+    out = []
+    p = 10 if prelude[:4] == b"rgxd" else 0
+    while p < len(prelude):
+        length = prelude[p]
+        if 2 < length <= 64 and p + 1 + length <= len(prelude):
+            cand = prelude[p + 1:p + 1 + length].rstrip(b"\x00")
+            if cand and all(32 <= c < 127 for c in cand):
+                out.append(cand.decode("ascii"))
+                p += 1 + length
+                continue
+        p += 1
+    return out
+
+
 def _infer_name(prelude: bytes, index: int) -> str:
+    strings = _pascal_strings(prelude)
+    # Preferred: the first pascal string that looks like a shader entry name
+    # (stage-prefixed), which skips 'NULL' placeholders and 'g*' param names.
+    for s in strings:
+        if SHADER_NAME_RE.match(s):
+            return s
+    # Fallback: a stage-prefixed token anywhere in the prelude.
     matches = NAME_RE.findall(prelude)
     if matches:
         return matches[-1].decode("ascii", errors="replace")
+    # Last resort: the first printable pascal string, else a blob placeholder.
+    for s in strings:
+        if s != "NULL" and not s.startswith("g"):
+            return s
     return f"blob_{index:02d}"
 
 
