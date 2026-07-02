@@ -1072,6 +1072,9 @@ class ShaderManagerApp:
             messagebox.showerror("Error", f"Failed to export CSO:\n{e}")
 
     def _fxc_save(self):
+        if getattr(self, "fxc_is_rdr1", False):
+            return messagebox.showinfo("RDR1", "RDR1 archives are written by Repack (which backs up "
+                                       "the original automatically) — Save FXC is not needed.")
         if not hasattr(self, 'fxc_current_file') or not self.fxc_current_file: return messagebox.showwarning("Warning", "No FXC loaded.")
         
         filepath = filedialog.asksaveasfilename(title="Save FXC", initialfile=os.path.basename(self.fxc_current_filepath), defaultextension=".fxc", filetypes=[("FXC Files", "*.fxc"), ("All Files", "*.*")])
@@ -1811,9 +1814,20 @@ class ShaderManagerApp:
         self.refresh_all()
 
     def _update_fxc_mode_ui(self):
-        """Switch the FXC tab's banner text between GTA5 Legacy and RDR1."""
+        """Switch the FXC tab's banner text between GTA5 Legacy and RDR1, and
+        drop any archive loaded under the previous profile so the DX11 parser
+        never sees rgxd data (and vice versa)."""
         if not hasattr(self, 'fxc_banner_title'):
             return
+        # Clear loaded-archive state from the other profile.
+        self.fxc_current_file = None
+        self.fxc_is_rdr1 = False
+        self._fxc_rdr1_data = None
+        self.fxc_current_shader = None
+        if hasattr(self, 'fxc_shader_tree'):
+            self.fxc_shader_tree.delete(*self.fxc_shader_tree.get_children())
+        if hasattr(self, 'fxc_status_var'):
+            self.fxc_status_var.set("Ready — No FXC selected")
         if self.dx_version.get() == "rdr1":
             self.fxc_banner_title.config(text="📦  RDR1 — DX12 rgxd .fxc Archives")
             self.fxc_banner_body.config(
@@ -2589,25 +2603,26 @@ class ShaderManagerApp:
         self._log(f"Disassembling {os.path.basename(path)}...")
         try:
             cmd = []
-            if self.dx_version.get() == "dx12":
-                 # Try using dxc for disassembly. DXC usually supports -dumpbin on compiled shaders? 
-                 # Or spirv-dis equivalent? 
+            if self.dx_version.get() in ("dx12", "rdr1"):
+                 # Try using dxc for disassembly. DXC usually supports -dumpbin on compiled shaders?
+                 # Or spirv-dis equivalent?
                  # Actually `dxc.exe -dumpbin <file>` works for signed containers sometimes, or `dxc -P <file>`?
                  # Microsoft's `dxc.exe` is primarily a compiler. To disassemble a DXIL container we often need `dxil-dis` or `dxc -dumpbin`.
                  # Let's try `dxc -dumpbin`. If it fails, we fall back to generic "Not Supported" message.
+                 # RDR1 blobs are DXIL containers too, so they take the dxc path.
                  cmd = [self.tools["dxc"], '-dumpbin', path]
             else:
                  # fxc.exe /nologo /dumpbin <path>
                  cmd = [self.tools["fxc"], '/nologo', '/dumpbin', path]
 
             res = subprocess.run(cmd, capture_output=True, text=True, errors='ignore')
-            
+
             if res.returncode == 0:
                 self.root.after(0, lambda: AsmWindow(self.root, os.path.basename(path), res.stdout))
                 self._log("ASM view opened.")
             else:
                 self._log(f"ASM Error: {res.stderr}")
-                if self.dx_version.get() == "dx12":
+                if self.dx_version.get() in ("dx12", "rdr1"):
                     self._log("Tip: Ensure 'dxc.exe' supports -dumpbin or use external tool.")
         except Exception as e:
             self._log(f"ASM Exception: {e}")
