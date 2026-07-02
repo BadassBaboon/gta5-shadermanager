@@ -48,6 +48,8 @@ try:
     from awclib.awc_writer import AWCRebuilder
     from awclib.models import AWCFile, Shader
     from awclib.decompiler import decompile_shader
+    from core.semantic_fixup import fixup_semantics
+    from core import rdr1_fxc
 except ImportError as e:
     print(f"Critical Import Error: {e}")
     print("Ensure the src/ package (core/, ui/, tools/, awclib/) is intact and run from the shadermanager root.")
@@ -162,11 +164,12 @@ class ShaderManagerApp:
         # Create base directories
         for d in self.dirs.values(): os.makedirs(d, exist_ok=True)
         
-        # Create DX11/DX12 subdirectories for relevant folders
+        # Create per-profile subdirectories for relevant folders
         for key in ["source", "compiled", "decompiled"]:
             base = self.dirs[key]
             os.makedirs(os.path.join(base, "dx11"), exist_ok=True)
             os.makedirs(os.path.join(base, "dx12"), exist_ok=True)
+            os.makedirs(os.path.join(base, "rdr1"), exist_ok=True)
 
     def on_close(self):
         self.watcher_running = False
@@ -587,6 +590,9 @@ class ShaderManagerApp:
         rb_dx12 = ttk.Radiobutton(toolbar, text="DX12 — Enhanced", variable=self.dx_version, value="dx12", command=self._on_dx_change, bootstyle="toolbutton-danger")
         rb_dx12.pack(side=LEFT, padx=2)
         hint(rb_dx12, "GTA 5 Enhanced (new version).\nDirectX 12, Shader Model 6.0+, dxc.exe compiler.\nUses .awc shader archives.")
+        rb_rdr1 = ttk.Radiobutton(toolbar, text="RDR1 — DX12", variable=self.dx_version, value="rdr1", command=self._on_dx_change, bootstyle="toolbutton-success")
+        rb_rdr1.pack(side=LEFT, padx=2)
+        hint(rb_rdr1, "Red Dead Redemption (PC port).\nDirectX 12, Shader Model 6.0, dxc.exe compiler.\nUses rgxd .fxc shader archives (RDR1 FXC tab).\nI/O semantics auto-restored on decompile.")
         
         ttk.Separator(toolbar, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=10)
 
@@ -707,8 +713,10 @@ class ShaderManagerApp:
         # --- Info Banner ---
         banner = ttk.Frame(page, padding=10, bootstyle="warning")
         banner.pack(fill=X, pady=(0, 10))
-        ttk.Label(banner, text="📦  GTA 5 Legacy — DX11 Archives", font=("Segoe UI", 10, "bold"), bootstyle="inverse-warning").pack(side=LEFT, padx=(0, 10))
-        ttk.Label(banner, text="This tab is for GTA 5 Legacy (older version). Select a .fxc archive file on the left, then: 1) Unpack it to extract shaders,  2) Go to 'Compile & Decompile' to edit and recompile,  3) Come back here and Repack to inject your changes back into the archive.", wraplength=900, bootstyle="inverse-warning").pack(side=LEFT, fill=X, expand=True)
+        self.fxc_banner_title = ttk.Label(banner, text="📦  GTA 5 Legacy — DX11 Archives", font=("Segoe UI", 10, "bold"), bootstyle="inverse-warning")
+        self.fxc_banner_title.pack(side=LEFT, padx=(0, 10))
+        self.fxc_banner_body = ttk.Label(banner, text="This tab is for GTA 5 Legacy (older version). Select a .fxc archive file on the left, then: 1) Unpack it to extract shaders,  2) Go to 'Compile & Decompile' to edit and recompile,  3) Come back here and Repack to inject your changes back into the archive.", wraplength=900, bootstyle="inverse-warning")
+        self.fxc_banner_body.pack(side=LEFT, fill=X, expand=True)
         
 
         tools = ttk.Frame(page)
@@ -821,14 +829,29 @@ class ShaderManagerApp:
                 self._load_fxc_file(filepath)
 
     def _load_fxc_file(self, filepath):
+        # RDR1 rgxd container: parse with rdr1_fxc, not the DX11 FxcFile.
+        if self.dx_version.get() == "rdr1":
+            try:
+                with open(filepath, 'rb') as f: data = f.read()
+                self.fxc_is_rdr1 = True
+                self.fxc_current_file = None
+                self._fxc_rdr1_data = data
+                self.fxc_current_filepath = filepath
+                self._fxc_populate_tree()
+                self.fxc_status_var.set(f"Loaded (RDR1): {os.path.basename(filepath)}")
+            except Exception as e:
+                self.fxc_status_var.set("Error parsing RDR1 FXC")
+                self._log(f"RDR1 FXC Parse Error: {e}")
+            return
         try:
             self._log(f"Parsing FXC: {os.path.basename(filepath)}...")
             with open(filepath, 'rb') as f: data = f.read()
+            self.fxc_is_rdr1 = False
             self.fxc_current_file = fxc_parser.FxcFile()
             self.fxc_current_file.load(data)
-            
+
             self.fxc_current_filepath = filepath
-            
+
             self.fxc_status_var.set(f"Loaded: {os.path.basename(filepath)}")
             self._fxc_populate_tree()
             self._log(f"Successfully loaded FXC headers.")
@@ -836,7 +859,36 @@ class ShaderManagerApp:
             self.fxc_status_var.set(f"Error parsing FXC")
             self._log(f"FXC Parse Error: {e}")
 
+    def _fxc_populate_rdr1(self):
+        """Populate the middle shader tree from an RDR1 rgxd container,
+        grouped by stage inferred from the shader-name prefix."""
+        self.fxc_shader_tree.delete(*self.fxc_shader_tree.get_children())
+        data = getattr(self, "_fxc_rdr1_data", None)
+        if not data: return
+        search_term = self.fxc_shader_search_var.get().lower() if hasattr(self, 'fxc_shader_search_var') else ""
+        blobs = rdr1_fxc.scan(data)
+
+        def stage_of(name):
+            for s in ("VS", "PS", "CS", "GS", "HS", "DS"):
+                if name.upper().startswith(s): return s
+            return "Misc"
+
+        groups = {}
+        self.fxc_rdr1_map = {}
+        for b in blobs:
+            if search_term and search_term not in b.name.lower(): continue
+            st = stage_of(b.name)
+            if st not in groups:
+                groups[st] = self.fxc_shader_tree.insert("", "end", text=f"{st} Shaders", values=("", "", ""), open=True)
+            blob_bytes = data[b.offset:b.offset + b.size]
+            item = self.fxc_shader_tree.insert(groups[st], "end", text=f"{b.index:02d}_{b.name}",
+                                               values=(renodx_hash(blob_bytes), st, f"{b.size:,}"))
+            self.fxc_rdr1_map[item] = b
+
     def _fxc_populate_tree(self):
+        if getattr(self, "fxc_is_rdr1", False):
+            self._fxc_populate_rdr1()
+            return
         self.fxc_shader_tree.delete(*self.fxc_shader_tree.get_children())
         if not self.fxc_current_file: return
         
@@ -871,6 +923,21 @@ class ShaderManagerApp:
 
     def _on_fxc_shader_select(self, event):
         sel = self.fxc_shader_tree.selection()
+        # RDR1: minimal details from the scanned blob (no DX11 reflection tables).
+        if getattr(self, "fxc_is_rdr1", False):
+            if sel and hasattr(self, 'fxc_rdr1_map') and sel[0] in self.fxc_rdr1_map:
+                b = self.fxc_rdr1_map[sel[0]]
+                blob = self._fxc_rdr1_data[b.offset:b.offset + b.size]
+                info = (f"Name: {b.name}\nIndex: {b.index}\nRenoDX Hash: {renodx_hash(blob)}\n"
+                        f"Size: {b.size:,} bytes\nOffset: 0x{b.offset:X}\n\n"
+                        f"RDR1 SM6.0 DXIL. Use Unpack to extract, then the "
+                        f"'Compile & Decompile' tab (RDR1 profile) to edit.")
+                if hasattr(self, 'fxc_details'):
+                    self.fxc_details.config(state=tk.NORMAL)
+                    self.fxc_details.delete("1.0", tk.END)
+                    self.fxc_details.insert(tk.END, info)
+                    self.fxc_details.config(state=tk.DISABLED)
+            return
         if sel and hasattr(self, 'fxc_shader_map') and sel[0] in self.fxc_shader_map:
             shader = self.fxc_shader_map[sel[0]]
             self.fxc_current_shader = shader
@@ -903,6 +970,9 @@ class ShaderManagerApp:
             self.fxc_details.config(state=tk.DISABLED)
 
     def _fxc_import(self):
+        if getattr(self, "fxc_is_rdr1", False):
+            return messagebox.showinfo("RDR1", "For RDR1 archives, use Unpack then Repack — "
+                                       "the whole archive is handled at once, no per-shader CSO import needed.")
         if not hasattr(self, 'fxc_current_file') or not self.fxc_current_file: return messagebox.showwarning("Warning", "Open an FXC file first.")
         if not hasattr(self, 'fxc_current_shader') or not self.fxc_current_shader: return messagebox.showwarning("Warning", "Select a shader from the list first.")
         
@@ -953,6 +1023,9 @@ class ShaderManagerApp:
             messagebox.showerror("Error", f"Failed to import CSO:\n{e}")
 
     def _fxc_export(self):
+        if getattr(self, "fxc_is_rdr1", False):
+            return messagebox.showinfo("RDR1", "For RDR1 archives, use Unpack — it extracts every "
+                                       "shader as .cso into compiled/rdr1/<archive>/ automatically.")
         if not hasattr(self, 'fxc_current_file') or not self.fxc_current_file: return messagebox.showwarning("Warning", "Open an FXC file first.")
         
         sel = self.fxc_shader_tree.selection()
@@ -1598,10 +1671,13 @@ class ShaderManagerApp:
         # No explicit shader model in the filename. Pick the default profile for
         # the active DX mode: DX12/dxc requires SM6+ (it cannot compile *_5_0),
         # and GTA5 Enhanced compute shaders are uniformly cs_6_6.
-        dx12 = self.dx_version.get() == "dx12"
+        ver = self.dx_version.get()
         def _prof(stage):
-            if dx12:
+            if ver == "dx12":
                 return f"{stage}_6_6" if stage == "cs" else f"{stage}_6_0"
+            if ver == "rdr1":
+                # RDR1 is uniformly SM 6.0 (verified across terrain/postfx).
+                return f"{stage}_6_0"
             return f"{stage}_5_0"
 
         folder = os.path.basename(os.path.dirname(path)).upper()
@@ -1699,27 +1775,60 @@ class ShaderManagerApp:
 
     def _on_dx_change(self):
         ver = self.dx_version.get()
+        # DX12-family profiles (Enhanced + RDR1) use dxc/SM6 and expose the
+        # decompile-method selector. RDR1 additionally uses the FXC tab (its
+        # rgxd .fxc archives), while Enhanced uses the AWC tab.
+        dx12_family = ver in ("dx12", "rdr1")
+
+        # AWC tab: Enhanced only.
+        if hasattr(self, 'btn_awc'):
+            if ver == "dx12":
+                self.btn_awc.pack(fill=X, pady=2, after=self.btn_dev)
+            else:
+                self.btn_awc.pack_forget()
+
+        # FXC tab: Legacy (DX11) and RDR1.
         if ver == "dx12":
             self.btn_fxc.pack_forget()
-            if hasattr(self, 'btn_awc'):
-                self.btn_awc.pack(fill=X, pady=2, after=self.btn_dev)
-                
-            if hasattr(self, 'fr_decomp_method') and hasattr(self, 'sep_view_mode'):
-                self.fr_decomp_method.pack(side=LEFT, before=self.sep_view_mode, padx=(0, 10))
-            
-            if self.current_page == "fxc":
-                self._show_page("dev")
         else:
-            if hasattr(self, 'btn_awc'):
-                self.btn_awc.pack_forget()
             self.btn_fxc.pack(fill=X, pady=2, after=self.btn_dev)
-            
-            if hasattr(self, 'fr_decomp_method'):
+
+        # Decompile-method selector: DX12-family only.
+        if hasattr(self, 'fr_decomp_method') and hasattr(self, 'sep_view_mode'):
+            if dx12_family:
+                self.fr_decomp_method.pack(side=LEFT, before=self.sep_view_mode, padx=(0, 10))
+            else:
                 self.fr_decomp_method.pack_forget()
-                
-            if self.current_page == "awc":
-                self._show_page("dev")
+
+        # Leave a page that no longer applies to the active profile.
+        if self.current_page == "fxc" and ver == "dx12":
+            self._show_page("dev")
+        if self.current_page == "awc" and ver != "dx12":
+            self._show_page("dev")
+
+        # Retarget the FXC tab banner/handlers for RDR1 vs Legacy.
+        self._update_fxc_mode_ui()
         self.refresh_all()
+
+    def _update_fxc_mode_ui(self):
+        """Switch the FXC tab's banner text between GTA5 Legacy and RDR1."""
+        if not hasattr(self, 'fxc_banner_title'):
+            return
+        if self.dx_version.get() == "rdr1":
+            self.fxc_banner_title.config(text="📦  RDR1 — DX12 rgxd .fxc Archives")
+            self.fxc_banner_body.config(
+                text="This tab is for Red Dead Redemption (PC). Select an RDR1 .fxc "
+                     "archive on the left, then: 1) Unpack to extract SM6.0 shaders as .cso,  "
+                     "2) Go to 'Compile & Decompile' (RDR1 profile) to decompile — I/O "
+                     "semantics are auto-restored — edit and recompile,  3) Repack here to "
+                     "splice your changes back in. Size changes are handled automatically.")
+        else:
+            self.fxc_banner_title.config(text="📦  GTA 5 Legacy — DX11 Archives")
+            self.fxc_banner_body.config(
+                text="This tab is for GTA 5 Legacy (older version). Select a .fxc archive file "
+                     "on the left, then: 1) Unpack it to extract shaders,  2) Go to 'Compile & "
+                     "Decompile' to edit and recompile,  3) Come back here and Repack to inject "
+                     "your changes back into the archive.")
 
     def refresh_source(self):
         self.src_tree.delete(*self.src_tree.get_children())
@@ -1811,17 +1920,18 @@ class ShaderManagerApp:
                 threading.Thread(target=self._worker_parse_fxc_counts, args=(items_to_parse,), daemon=True).start()
 
     def _worker_parse_fxc_counts(self, items):
+        rdr1_mode = self.dx_version.get() == "rdr1"
         for item_id, path in items:
             try:
                 with open(path, 'rb') as f: data = f.read()
-                fxc = fxc_parser.FxcFile()
-                fxc.load(data)
-                
-                count = 0
-                for grp in fxc.ShaderGroups:
-                    if grp.Shaders:
-                        count += len(grp.Shaders)
-                        
+                if rdr1_mode:
+                    # rgxd container: count embedded DXBC/DXIL blobs.
+                    count = len(rdr1_fxc.scan(data))
+                else:
+                    fxc = fxc_parser.FxcFile()
+                    fxc.load(data)
+                    count = sum(len(grp.Shaders) for grp in fxc.ShaderGroups if grp.Shaders)
+
                 # UI update thread safe
                 self.root.after(0, lambda i=item_id, c=count: self._update_fxc_count(i, c))
             except Exception: pass
@@ -2006,11 +2116,13 @@ class ShaderManagerApp:
             tmp = os.path.join(self._get_current_dir("compiled"), "_temp.cso")
             
             cmd = []
-            if self.dx_version.get() == "dx12":
+            if self.dx_version.get() in ("dx12", "rdr1"):
                 # dxc only supports Shader Model 6.0+. If a *_5_0 profile slipped
                 # through (e.g. an explicitly named legacy file compiled in DX12
                 # mode), upgrade it so the compile doesn't fail outright:
                 # compute -> 6_6 (the SM the game uses), everything else -> 6_0.
+                # RDR1 ships SM6.0 exclusively (verified: ps_6_0/vs_6_0), so its
+                # default profiles are 6_0 (see _detect_profile).
                 dxc_prof = prof
                 if dxc_prof.endswith("_5_0"):
                     stage = dxc_prof.split("_", 1)[0]
@@ -2027,7 +2139,16 @@ class ShaderManagerApp:
                 res = subprocess.run(cmd, capture_output=True, text=True)
                 if res.returncode == 0:
                     out_paths = list(set(out_paths))
-                    for op in out_paths: 
+                    for op in out_paths:
+                        # Never destroy the game's original blob: keep a
+                        # one-time .orig backup next to it the first time a
+                        # recompile lands on an existing .cso. Decompile and
+                        # semantic fixup need the original as reference.
+                        if os.path.exists(op) and not os.path.exists(op + ".orig"):
+                            try:
+                                shutil.copy2(op, op + ".orig")
+                            except OSError:
+                                pass
                         shutil.copy2(tmp, op)
                     self._log(f"  -> Success ({len(out_paths)} dests)")
                 else:
@@ -2059,10 +2180,10 @@ class ShaderManagerApp:
                     
                     # Logic to move generated file (usually created next to input)
                     src_gen = os.path.join(os.path.dirname(p), base + ".hlsl")
-                    if os.path.exists(src_gen): 
+                    if os.path.exists(src_gen):
                         shutil.move(src_gen, os.path.join(out, base + ".hlsl"))
-                
-                elif mode == "dx12":
+
+                elif mode in ("dx12", "rdr1"):
                     method = self.decomp_method_var.get()
                     target_file = os.path.join(out, base + ".hlsl")
 
@@ -2147,7 +2268,18 @@ class ShaderManagerApp:
                             self._log(f"Error (spirv-cross): {res2.stderr}")
                         else:
                             self._log(f"Decompiled: {base}.hlsl")
-                            
+
+                            # spirv-cross renumbers all non-SV semantics
+                            # sequentially (TEXCOORD1..n), losing the original
+                            # names (POSITION1, TEXCOORD0..). A recompiled
+                            # stage then can't link against an original
+                            # counterpart stage. Restore the original
+                            # semantics from the source container.
+                            try:
+                                fixup_semantics(self.tools["dxc"], p, target_file, log=self._log)
+                            except Exception as e:
+                                self._log(f"Warning: semantic fixup failed: {e}")
+
                             # Add entry point info as comment
                             entry_point = self._get_entry_point_dx12(p)
                             if entry_point and os.path.exists(target_file):
@@ -2201,6 +2333,18 @@ class ShaderManagerApp:
         self.msg_queue.put(("REFRESH", None))
 
     def _worker_unpack(self, p):
+        # RDR1 rgxd .fxc: use the DX12/SM6 rdr1_fxc handler instead of the
+        # DX11 FxcFile parser. Blobs land flat as NN_Name.cso under
+        # compiled/rdr1/<archive>/ (+ a manifest) ready for the DX12 decompile.
+        if self.dx_version.get() == "rdr1":
+            try:
+                folder_name = os.path.splitext(os.path.basename(p))[0]
+                out = os.path.join(self.dirs["compiled"], "rdr1", folder_name)
+                ents = rdr1_fxc.unpack(p, out)
+                self._log(f"Unpacked (RDR1) {os.path.basename(p)} -> {len(ents)} shaders.")
+            except Exception as e:
+                self._log(f"Error unpacking RDR1 {os.path.basename(p)}: {e}")
+            return
         try:
             with open(p, 'rb') as f: data = f.read()
             fxc = fxc_parser.FxcFile(); fxc.load(data)
@@ -2233,6 +2377,28 @@ class ShaderManagerApp:
         self.msg_queue.put(("P_STOP", None))
 
     def _worker_repack(self, p):
+        # RDR1 rgxd .fxc: splice edited .cso blobs back via rdr1_fxc. Size
+        # changes are handled (u16 record size patched); only changed blobs are
+        # swapped. Reads from compiled/rdr1/<archive>/ where unpack + the DX12
+        # compile step place the .cso files.
+        if self.dx_version.get() == "rdr1":
+            folder_name = os.path.splitext(os.path.basename(p))[0]
+            blob_dir = os.path.join(self.dirs["compiled"], "rdr1", folder_name)
+            if not os.path.exists(blob_dir):
+                self._log(f"Folder not found: {folder_name}. Unpack first.")
+                return
+            try:
+                backup_dir = os.path.join(os.path.dirname(p), "backups")
+                os.makedirs(backup_dir, exist_ok=True)
+                shutil.copy2(p, os.path.join(backup_dir, os.path.basename(p) + ".bak"))
+                rep = rdr1_fxc.repack(p, blob_dir, p, log=self._log)
+                if rep > 0:
+                    self._log(f"Repacked (RDR1) {os.path.basename(p)}: {rep} shader(s) updated.")
+                else:
+                    self._log(f"No changes for {os.path.basename(p)}.")
+            except Exception as e:
+                self._log(f"Error repacking RDR1 {os.path.basename(p)}: {e}")
+            return
         folder_name = os.path.splitext(os.path.basename(p))[0]
         # FXC Manager hardcoded to dx11 as requested
         d_dir = os.path.join(self.dirs["compiled"], "dx11", folder_name)
