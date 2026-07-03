@@ -49,6 +49,7 @@ try:
     from awclib.models import AWCFile, Shader
     from awclib.decompiler import decompile_shader
     from core.semantic_fixup import fixup_semantics
+    from core.cbuffer_annotate import annotate_hlsl
     from core import rdr1_fxc
 except ImportError as e:
     print(f"Critical Import Error: {e}")
@@ -2272,12 +2273,27 @@ class ShaderManagerApp:
                             # (helps some complex cbuffer layouts).
                             res2 = subprocess.run([self.tools["spirv_cross"], temp_spv] + _base_opts,
                                                   capture_output=True, text=True, cwd=self.dirs["compilers"])
+                        used_flatten = False
                         if res2.returncode != 0:
                             # Tier 3: --flatten-ubo rescues shaders whose $Globals
                             # holds a (statically-indexed) scalar float array that
-                            # HLSL cbuffers can't 16-byte-align.
+                            # HLSL cbuffers can't 16-byte-align. READ-ONLY output:
+                            # flattened uniforms merge every cbuffer into one
+                            # implicit $Globals at cb0, so compiling it binds all
+                            # constants wrong (silent in-game corruption).
                             res2 = subprocess.run([self.tools["spirv_cross"], temp_spv, "--flatten-ubo"] + _base_opts,
                                                   capture_output=True, text=True, cwd=self.dirs["compilers"])
+                            used_flatten = (res2.returncode == 0)
+                        if used_flatten and os.path.exists(target_file):
+                            try:
+                                with open(target_file, 'r') as f: _flat = f.read()
+                                with open(target_file, 'w') as f:
+                                    f.write("// READ-ONLY DECOMPILE: cbuffer layout was FLATTENED (--flatten-ubo).\n"
+                                            "// Compiling this file would bind every constant buffer to cb0 and\n"
+                                            "// corrupt rendering. For reference/reading only.\n"
+                                            "#error This flattened decompile must not be compiled - see header.\n\n" + _flat)
+                                self._log(f"  -> NOTE: {base} decompiled READ-ONLY (flattened cbuffers; do not compile).")
+                            except Exception: pass
 
                         # Clean up temp SPIR-V file
                         if os.path.exists(temp_spv):
@@ -2312,10 +2328,19 @@ class ShaderManagerApp:
                             if entry_point and os.path.exists(target_file):
                                 try:
                                     with open(target_file, 'r') as f: content = f.read()
-                                    with open(target_file, 'w') as f: 
+                                    with open(target_file, 'w') as f:
                                         f.write(f"// Original Entry Function: {entry_point}\n// Decompiled via dxil-spirv + spirv-cross\n\n" + content)
                                 except Exception as e:
                                     self._log(f"Warning: Could not add header: {e}")
+
+                            # Reconstruct real cbuffer parameter names from the
+                            # original blob's reflection (RDR1 blobs carry full
+                            # member names; the SPIR-V roundtrip discards them).
+                            # Uses <cso>.orig automatically if p was recompiled.
+                            try:
+                                annotate_hlsl(self.tools["dxc"], p, target_file, log=self._log)
+                            except Exception as e:
+                                self._log(f"Warning: param-map annotation failed: {e}")
                     
             except Exception as e: 
                 self._log(f"Decompile Exception: {e}")
