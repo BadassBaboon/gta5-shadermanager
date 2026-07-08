@@ -7,7 +7,7 @@ Supports both **GTA 5 Legacy (DX11)** and **GTA 5 Enhanced (DX12)**.
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![DX11](https://img.shields.io/badge/DX11-Shader%20Model%205.0-green) ![DX12](https://img.shields.io/badge/DX12-Shader%20Model%206.x-red)
 
 ## Fork notes:
-This fork keeps the original GTA 5 shader editing intact but also adds support for editing Red Dead Redemption 1 (PC) `.fxc` shader editing. Initial `.fxc` editing was made possible thanks to [Clippy95](https://github.com/Clippy95) for discovering headers and symbols so the manager can work with Red Dead Redemption 1's shaders in the first place.
+This fork keeps the upstream repository's GTA 5 shader editing features intact but also adds support for Red Dead Redemption 1 (PC) `.fxc` shader editing. Initial `.fxc` editing was made possible thanks to [Clippy95](https://github.com/Clippy95) for discovering headers and symbols so the manager can work with Red Dead Redemption 1's shaders in the first place.
 
 ---
 
